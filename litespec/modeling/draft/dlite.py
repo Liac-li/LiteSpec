@@ -515,9 +515,15 @@ class Qwen3DLiteAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
+        cached = kwargs.pop("preprojected_context", None)
+        prefix_length = cached[0].shape[1] if cached is not None else 0
+        k_ctx = self.k_proj(target_hidden[:, prefix_length:])
+        if cached is not None:
+            k_ctx = torch.cat([cached[0], k_ctx], dim=1)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
+        v_ctx = self.v_proj(target_hidden[:, prefix_length:])
+        if cached is not None:
+            v_ctx = torch.cat([cached[1], v_ctx], dim=1)
         v_noise = self.v_proj(hidden_states)
 
         cos, sin = position_embeddings
@@ -777,6 +783,24 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             # for baseline, vision and text under the same seed.
             with torch.random.fork_rng(devices=[]):
                 self.memory_reader = PivotMemoryReader(hidden_size, int(dlite_config.get("memory_rank", 256)))
+
+        self.visual_kv = None
+        if dlite_config.get("experiment_name"):
+            from .visual_kv import experiment_settings, ParallelHead, VisualKVModule
+            source_layer = dlite_config.get("evidence_layer_id")
+            if not isinstance(source_layer, int) or isinstance(source_layer, bool) or not 0 <= source_layer < config.num_target_layers:
+                raise ValueError("evidence_layer_id must be a valid Target layer index")
+            if self.architecture_version != "dlite_v2":
+                raise ValueError("visual-KV controls require dlite_v2 local positions")
+            expected = experiment_settings(dlite_config["experiment_name"])
+            if any(dlite_config.get(k) != v for k, v in expected.items()):
+                raise ValueError("visual-KV experiment configuration mismatch")
+            if not self.is_student or memory_mode != "none":
+                raise ValueError("visual-KV controls require a student with legacy memory disabled")
+            with torch.random.fork_rng(devices=[]):
+                self.visual_kv = VisualKVModule(hidden_size, dlite_config)
+                if dlite_config["prediction_head"] == "parallel":
+                    self.sequential_head = ParallelHead(hidden_size, self.sequential_rank, config.vocab_size)
 
     @property
     def chs_len_per_block(self) -> int:
@@ -1216,6 +1240,13 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         disable_memory: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        if self.visual_kv is not None:
+            from .visual_kv import forward_context
+            anchors = kwargs.pop("context_anchors")
+            keep = kwargs.pop("context_block_keep")
+            return forward_context(self, query=noise_embedding, pivot=target_hidden,
+                anchors=anchors, block_keep=keep, evidence=kwargs.pop("context_evidence", None),
+                kernel_options=kwargs.pop("kernel_options", None))
         hidden_states = noise_embedding
         if self.memory_reader is not None and not disable_memory:
             residual = self.memory_reader(target_hidden, prompt_memory)

@@ -32,6 +32,7 @@ def register_optimizer_parameters(model, parameters=None):
         "candidate_selector",
         "markov_head",
         "sequential_head",
+        "visual_kv",  # Reader slots and GRU use AdamW; backbone policy is unchanged.
         "confidence_head",
     }
     for path, module in model.named_modules(remove_duplicate=False):

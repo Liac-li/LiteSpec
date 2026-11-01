@@ -67,6 +67,7 @@ def main():
     parser.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="full_target_replay")
     parser.add_argument("--ar-reference", type=Path, help="reuse a completed same-GPU/same-input AR cell instead of timing AR again")
     parser.add_argument("--cpu-inputs", action="store_true", help="retain prepared prompts on CPU; transfer only current prompt before timing")
+    parser.add_argument("--reset-visual-state", action="store_true")
     parser.add_argument("--memory-condition", choices=["correct", "wrong_image", "disabled"], default="correct")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
     parser.add_argument("--profile-decode", action="store_true", help="separate instrumented pass; keep normal speed measurements")
@@ -194,7 +195,7 @@ def main():
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
                         profile=profile, state_mode=args.state_mode, memory_example=donor,
-                        disable_memory=args.memory_condition == "disabled")
+                        disable_memory=args.memory_condition == "disabled", reset_visual_state=args.reset_visual_state)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -213,6 +214,12 @@ def main():
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
                 mean_image_tokens=sum(meta["image_tokens"] for meta in input_metadata)/len(input_metadata),
                 attention_backend=attention, **summarize_batches(results, batch_size))
+            if draft is not None and getattr(draft, "visual_kv", None) is not None:
+                summary.update(experiment_name=draft.config.dlite_config['experiment_name'],
+                    draft_attention_backend=draft.config._attn_implementation,
+                    reset_visual_state=args.reset_visual_state,
+                    parameter_counts=getattr(draft.config, 'vlm_config', {}).get('parameter_counts'),
+                    draft_parameters=sum(p.numel() for p in draft.parameters()))
             summary.update(state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"],
                 peak_transaction_record_mib=max((r["peak_transaction_record_bytes"] or 0) for r in results)/1024**2)
             base = summary if label == "ar" else next(row for row in rows if row["model"] == "ar" and row["batch_size"] == batch_size)

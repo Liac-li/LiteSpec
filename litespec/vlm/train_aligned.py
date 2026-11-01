@@ -64,6 +64,13 @@ def load_config(path):
         raise ValueError("VLM adapter requires the no-history student")
     if cfg["num_epochs"] < 1 or cfg["accumulation_steps"] < 1 or cfg["num_anchors"] < 1:
         raise ValueError("epochs, accumulation and anchors must be positive")
+    if cfg.get("experiment_name"):
+        from litespec.modeling.draft.visual_kv import experiment_settings
+        cfg.update(experiment_settings(cfg["experiment_name"]))
+        if family != "dlite" or memory_mode != "none":
+            raise ValueError("visual-KV controls require DLite without legacy reader")
+        if cfg.get("flex_attention_backend", "TRITON").upper() != "TRITON":
+            raise ValueError("visual-KV sparse training currently requires TRITON FlexAttention")
     cfg["upstream_config_sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
     cfg["context_policy"] = dict(prefill_text="drop", prefill_vision="drop", decode_mode="none",
                                  window_size=0, implementation="compact")
@@ -228,7 +235,11 @@ def make_online(target, draft, cfg):
     if cfg.get("algorithm", "dlite") != "dlite":
         from .baselines import make_online as baseline_online
         return baseline_online(target, draft, cfg)
-    cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
+    if getattr(draft, "visual_kv", None) is not None:
+        from .visual_kv import OnlineVisualKV
+        cls = OnlineVisualKV
+    else:
+        cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
     return cls(
         draft, target.get_output_embeddings(), target.get_input_embeddings(),
         draft.mask_token_id, cfg["block_size"], attention_backend="flex_attention",
@@ -264,6 +275,9 @@ def prepare_forward(target, online, example):
         reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
+        if getattr(online.draft_model, "visual_kv", None) is not None:
+            from .visual_kv import attach_context
+            attach_context(batch, output.hidden_states, online.draft_model, example, target.config)
         if online.draft_model.memory_reader is not None:
             from .memory import build_prompt_memory, prompt_mask_from_example
             batch.prompt_memory = build_prompt_memory(output.hidden_states, online.draft_model,
@@ -487,6 +501,11 @@ def run(argv=None):
         from .baselines import make_draft as make_baseline
         draft = make_baseline(target, processor, cfg)
     draft.config._attn_implementation = "sdpa" if device == "cpu" else "flex_attention"
+    parameter_counts = dict(total=sum(p.numel() for p in draft.parameters()),
+        trainable=sum(p.numel() for p in draft.parameters() if p.requires_grad),
+        prediction_head=sum(p.numel() for p in draft.sequential_head.parameters()) if hasattr(draft, "sequential_head") else 0,
+        visual_context=sum(p.numel() for p in draft.visual_kv.parameters()) if getattr(draft, "visual_kv", None) is not None else 0)
+    draft.config.vlm_config["parameter_counts"] = parameter_counts
     draft.config.vlm_config["training"] = "upstream_sft_v1"
     if saved is not None:
         from .baselines import load_draft

@@ -94,7 +94,7 @@ def replicate_inputs(example, batch_size):
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
                           verification="block", profile=False, state_mode="full_target_replay",
-                          memory_example=None, disable_memory=False):
+                          memory_example=None, disable_memory=False, reset_visual_state=False):
     from .gdn_state import STATE_MODES, GDNStateTransaction
     if state_mode not in STATE_MODES:
         raise ValueError(f"unknown GDN state mode: {state_mode}")
@@ -105,15 +105,15 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
             return _generate_static_batch(target, draft, example, batch_size=batch_size,
                 max_new_tokens=max_new_tokens, verification=verification, profile=profile,
                 transaction=transaction, state_mode=state_mode,
-                memory_example=memory_example, disable_memory=disable_memory)
+                memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state)
     return _generate_static_batch(target, draft, example, batch_size=batch_size,
         max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode,
-        memory_example=memory_example, disable_memory=disable_memory)
+        memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state)
 
 
 def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens,
                            verification, profile, state_mode, transaction=None,
-                           memory_example=None, disable_memory=False):
+                           memory_example=None, disable_memory=False, reset_visual_state=False):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -138,7 +138,18 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     memory_build_seconds = 0.
     donor_prefill_seconds = 0.
     reader = getattr(draft, "memory_reader", None)
-    if memory_example is not None:
+    visual_control = draft is not None and getattr(draft, "visual_kv", None) is not None
+    visual_cache = None
+    visual_donor = None
+    if visual_control and memory_example is not None:
+        if disable_memory or draft.config.dlite_config['context_mode'] in {'pivot', 'pivot_history'}:
+            raise ValueError('wrong-image diagnosis requires an enabled visual-only context')
+        donor_inputs = replicate_inputs(memory_example, batch_size)
+        donor_started = clock(device)
+        donor_output = target(**donor_inputs, use_cache=False, output_hidden_states=True, logits_to_keep=1)
+        visual_donor = (donor_output, donor_inputs['input_ids'])
+        donor_prefill_seconds = clock(device)-donor_started
+    if memory_example is not None and not visual_control:
         if reader is None or draft.config.dlite_config.get("memory_mode") != "vision" or disable_memory:
             raise ValueError("wrong-image memory requires an enabled vision-memory checkpoint")
         from .memory import build_prompt_memory
@@ -165,7 +176,18 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         memory = reader.project(build_prompt_memory(output.hidden_states, draft,
             inputs["input_ids"], torch.ones_like(inputs["input_ids"], dtype=torch.bool), target.config))
         memory_build_seconds = clock(device) - memory_started
-    memory_tokens = int(memory.valid[0].sum()) if memory is not None else 0
+    if visual_control:
+        from .visual_kv import VisualKVCache
+        memory_started = clock(device)
+        visual_cache = VisualKVCache(draft, target, output, inputs, donor=visual_donor,
+            disable=disable_memory, reset_state=reset_visual_state)
+        memory_build_seconds = clock(device)-memory_started
+        visual_donor = None
+        if memory_example is not None:
+            del donor_output, donor_inputs
+    memory_tokens = (int(visual_cache.evidence.valid[0].sum())
+        if visual_cache is not None and visual_cache.evidence is not None else
+        int(memory.valid[0].sum()) if memory is not None else 0)
     del output, inputs
     prefill_end = clock(device)
     timeline = None
@@ -180,7 +202,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             candidates, kept = pending, 1
         else:
             if timeline: timeline.mark("draft")
-            if baseline:
+            if visual_control:
+                proposals, _ = visual_cache.propose(draft, target, pending, pivot, anchor)
+            elif baseline:
                 proposals, _ = history.propose(draft, target, pending, anchor)
             else:
                 hidden, _ = draft_block(draft, target.get_input_embeddings(), anchor_ids=pending,
@@ -259,6 +283,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             if timeline: timeline.mark("hidden_features")
             pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                     draft.config.num_target_layers)[:, kept-1:kept].detach().clone()
+            if visual_control:
+                visual_cache.commit(draft, output, kept, anchor)
             if baseline:
                 history.commit(draft, output, kept)
             del output
@@ -301,6 +327,10 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     result.update(memory_tokens=memory_tokens, memory_build_seconds=memory_build_seconds,
                   donor_prefill_seconds=donor_prefill_seconds,
                   memory_condition="disabled" if disable_memory else "wrong_image" if memory_example is not None else "correct")
+    if visual_control:
+        result.update(experiment_name=draft.config.dlite_config['experiment_name'],
+            reset_visual_state=reset_visual_state,
+            draft_parameters=sum(p.numel() for p in draft.parameters()))
     if transaction:
         result["cache_policy"] = "preallocated_attention_kv_" + state_mode
     if timeline:

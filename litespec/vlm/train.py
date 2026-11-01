@@ -63,6 +63,11 @@ def make_draft(target, processor, cfg):
             memory_mode=cfg["memory_mode"], memory_max_tokens=int(cfg.get("memory_max_tokens", 1024)),
             memory_rank=int(cfg.get("memory_rank", 256)),
             memory_layer_ids=cfg.get("memory_layer_ids", list(dict.fromkeys([layers[0], layers[len(layers)//2], layers[-1]]))))
+    if cfg.get("experiment_name"):
+        from litespec.modeling.draft.visual_kv import experiment_settings
+        config.dlite_config.update(experiment_settings(cfg["experiment_name"]))
+        config.dlite_config.update(evidence_layer_id=int(cfg.get("evidence_layer_id", depth//2)),
+            visual_slots=int(cfg.get("visual_slots", 16)), visual_state_rank=int(cfg.get("visual_state_rank", 64)))
     config.vlm_config = {"schema_version": 1, "target_model": cfg["target_model"],
                          "context_policy": cfg["context_policy"], "training": "direct_sft"}
     if cfg.get("image_max_tokens") is not None:

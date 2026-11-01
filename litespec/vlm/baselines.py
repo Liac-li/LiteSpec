@@ -21,6 +21,10 @@ def load_draft(path, **kwargs):
     name = config.architectures[0]
     if name not in classes:
         raise ValueError(f"unsupported VLM draft architecture: {name}")
+    # Experiment masks include block isolation and arbitrary evidence visibility;
+    # FlashAttention2 cannot represent this 4-D mask. Use SDPA for inference.
+    if getattr(config, "dlite_config", {}).get("experiment_name") and kwargs.get("attn_implementation") != "flex_attention":
+        kwargs["attn_implementation"] = "sdpa"
     return classes[name].from_pretrained(path, **kwargs)
 
 

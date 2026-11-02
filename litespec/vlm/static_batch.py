@@ -306,6 +306,12 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 first_candidate_hit=verified_hits[0] if len(verified_hits) else None,
                 verified_candidate_hits=verified_hits, committed_length=kept,
                 candidate_count=candidates.shape[1]-1,
+                # Record token alignment only for the paired first round.
+                anchor_token_id=candidates[0, 0].detach().clone() if emitted == 0 else None,
+                first_candidate_token_id=(candidates[0, 1].detach().clone()
+                    if emitted == 0 and candidates.shape[1] > 1 else None),
+                target_first_candidate_token_id=((predictions[0][0, 0] if verification == "sequential" else predictions[0, 0]).detach().clone()
+                    if emitted == 0 and candidates.shape[1] > 1 else None),
                 # Later block hits condition on candidate prefixes, not the AR trace.
                 comparison_scope="candidate_conditioned_target"))
             anchor += kept
@@ -314,6 +320,10 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         end_positions = torch.isin(candidates[0, :kept], eos_ids).nonzero()
         stop = end_positions.numel() > 0
         actual = int(end_positions[0, 0]) + 1 if stop else kept
+        if draft is not None:
+            round_diagnostics[-1]["emitted_length"] = actual
+            round_diagnostics[-1]["first_candidate_eligible"] = (
+                candidates.shape[1] > 1 and not (stop and actual == 1))
         blocks.append(candidates[:, :actual].clone())
         emitted += actual
         if draft is not None:
@@ -333,7 +343,11 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     for row in round_diagnostics:
         if torch.is_tensor(row["verified_candidate_hits"]):
             row["verified_candidate_hits"] = row["verified_candidate_hits"].tolist()
-        row["first_candidate_hit"] = row["verified_candidate_hits"][0] if row["verified_candidate_hits"] else None
+        row["first_candidate_hit"] = (row["verified_candidate_hits"][0]
+            if row["verified_candidate_hits"] and row["first_candidate_eligible"] else None)
+        for key in ("anchor_token_id", "first_candidate_token_id", "target_first_candidate_token_id"):
+            if torch.is_tensor(row[key]):
+                row[key] = int(row[key])
     tokens = torch.cat(blocks, 1)
     if not torch.equal(tokens, tokens[:1].expand_as(tokens)):
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")

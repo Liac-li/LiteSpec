@@ -239,7 +239,8 @@ def main():
             rows.append(summary)
             (root/"summary.json").write_text(json.dumps(rows, indent=2))
             with (root/"summary.csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                fields = list(dict.fromkeys(key for row in rows for key in row))
+                writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(rows)
             print(json.dumps(summary), flush=True)

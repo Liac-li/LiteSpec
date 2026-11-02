@@ -53,16 +53,30 @@ class VisualKVCache:
         disable=False,
         reset_state=False,
         state_donor=None,
+        context_schedule="always",
+        history_scope="full",
     ):
         self.mode = draft.config.dlite_config["context_mode"]
+        if context_schedule not in {"always", "off", "first_round"}:
+            raise ValueError("unknown context schedule")
+        if history_scope not in {"full", "prefill"}:
+            raise ValueError("unknown history scope")
+        if history_scope != "full" and self.mode != "pivot_history":
+            raise ValueError("prefill-only scope requires a trained pivot_history interface")
+        self.context_schedule = context_schedule
+        self.history_scope = history_scope
+        self.rounds = 0
         self.evidence = None
-        if self.mode == "pivot" or disable:
+        if self.mode == "pivot" or disable or context_schedule == "off":
             return
         source, ids = donor if donor is not None else (output, inputs["input_ids"])
         prompt = torch.ones_like(ids, dtype=torch.bool)
         self.evidence = gather_evidence(
             source.hidden_states, draft, ids, prompt, target.config
         )
+        if donor is not None:
+            # Donor prompt length must not hide its already-known visual tokens.
+            self.evidence.positions = torch.zeros_like(self.evidence.positions)
         self.evidence.state_prefix = None
         self.evidence.reset_state = reset_state
         self.evidence.encoded = draft.visual_kv.norm(self.evidence.values)
@@ -109,12 +123,18 @@ class VisualKVCache:
             context_evidence=self.evidence,
         )
         hidden = draft._prediction_hidden(output)
-        return draft.sample_draft_tokens(
+        result = draft.sample_draft_tokens(
             draft_hidden=hidden, first_prev_token_ids=pending[:, 0], temperature=0.0
         )
+        self.rounds += 1
+        if self.context_schedule == "first_round":
+            # No backward graph in inference. Drop raw bank AND per-layer K/V;
+            # commit must not append history or update state after this release.
+            self.evidence = None
+        return result
 
     def commit(self, draft, output, kept, anchor):
-        if self.evidence is None:
+        if self.evidence is None or (self.mode == "pivot_history" and self.history_scope == "prefill"):
             return
         from litespec.core.dlite import _hidden_at_layer
 
@@ -125,7 +145,7 @@ class VisualKVCache:
             draft.config.num_target_layers,
         )[:, :kept].detach()
         draft.visual_kv.commit(self.evidence, raw)
-        if self.mode == "pivot_history":
+        if self.mode == "pivot_history" and self.history_scope == "full":
             bank = self.evidence
             start = anchor
             positions = torch.arange(start, start + kept, device=raw.device)[
@@ -145,3 +165,4 @@ class VisualKVCache:
                 )
                 for old, layer in zip(bank.projected, draft.layers)
             ]
+

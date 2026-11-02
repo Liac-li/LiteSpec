@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="full_target_replay")
     parser.add_argument("--ar-reference", type=Path, help="reuse a completed same-GPU/same-input AR cell instead of timing AR again")
     parser.add_argument("--cpu-inputs", action="store_true", help="retain prepared prompts on CPU; transfer only current prompt before timing")
+    parser.add_argument("--context-schedule", choices=["always", "off", "first_round"], default="always")
+    parser.add_argument("--history-scope", choices=["full", "prefill"], default="full")
     parser.add_argument("--reset-visual-state", action="store_true")
     parser.add_argument("--memory-condition", choices=["correct", "wrong_image", "disabled"], default="correct")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
@@ -195,7 +197,8 @@ def main():
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
                         profile=profile, state_mode=args.state_mode, memory_example=donor,
-                        disable_memory=args.memory_condition == "disabled", reset_visual_state=args.reset_visual_state)
+                        disable_memory=args.memory_condition == "disabled", reset_visual_state=args.reset_visual_state,
+                        context_schedule=args.context_schedule, history_scope=args.history_scope)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -209,6 +212,8 @@ def main():
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
                 memory_condition=args.memory_condition if checkpoint else "none",
+                context_schedule=args.context_schedule if checkpoint else "none",
+                history_scope=args.history_scope if checkpoint else "none",
                 dataset_path=str(data), dataset_name=args.dataset_name,
                 input_mode=args.input_mode if args.reference_input else "from_manifest",
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
@@ -239,7 +244,7 @@ def main():
             rows.append(summary)
             (root/"summary.json").write_text(json.dumps(rows, indent=2))
             with (root/"summary.csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer = csv.DictWriter(handle, fieldnames=list(dict.fromkeys(k for row in rows for k in row)))
                 writer.writeheader()
                 writer.writerows(rows)
             print(json.dumps(summary), flush=True)
@@ -288,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

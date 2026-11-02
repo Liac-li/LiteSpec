@@ -15,7 +15,7 @@ export BLOCK_SIZE="${BLOCK_SIZE:-8}"
 export IMAGE_MAX_TOKENS="${IMAGE_MAX_TOKENS:-1024}"
 export TRAIN_SEED="${TRAIN_SEED:-42}"
 export REPORT_TO="${REPORT_TO:-tensorboard}"
-export SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-1}"
+export SAVE_TRAINING_STATE="${SAVE_TRAINING_STATE:-0}"
 export LITESPEC_EAGER_BLOCK_MASK="${LITESPEC_EAGER_BLOCK_MASK:-1}"
 export EXPERIMENTS="${EXPERIMENTS:-pivot_parallel pivot_rnn pivot_visual_parallel pivot_visual_rnn pivot_history_parallel pivot_history_rnn}"
 export RUN_GROUP="${RUN_GROUP:-$DLITE_WORKSPACE/runs/visual_kv_$(date +%Y%m%d_%H%M%S)_$$}"
@@ -60,3 +60,4 @@ PY
 done
 if [[ "${RUN_EVAL:-0}" == 1 ]]; then bash tests/eval_visual_kv.sh; fi
 echo "Completed: $RUN_GROUP"
+

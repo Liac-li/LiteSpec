@@ -94,7 +94,8 @@ def replicate_inputs(example, batch_size):
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
                           verification="block", profile=False, state_mode="full_target_replay",
-                          memory_example=None, disable_memory=False, reset_visual_state=False):
+                          memory_example=None, disable_memory=False, reset_visual_state=False,
+                          context_schedule="always", history_scope="full"):
     from .gdn_state import STATE_MODES, GDNStateTransaction
     if state_mode not in STATE_MODES:
         raise ValueError(f"unknown GDN state mode: {state_mode}")
@@ -105,15 +106,18 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
             return _generate_static_batch(target, draft, example, batch_size=batch_size,
                 max_new_tokens=max_new_tokens, verification=verification, profile=profile,
                 transaction=transaction, state_mode=state_mode,
-                memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state)
+                memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state,
+                context_schedule=context_schedule, history_scope=history_scope)
     return _generate_static_batch(target, draft, example, batch_size=batch_size,
         max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode,
-        memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state)
+        memory_example=memory_example, disable_memory=disable_memory, reset_visual_state=reset_visual_state,
+        context_schedule=context_schedule, history_scope=history_scope)
 
 
 def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens,
                            verification, profile, state_mode, transaction=None,
-                           memory_example=None, disable_memory=False, reset_visual_state=False):
+                           memory_example=None, disable_memory=False, reset_visual_state=False,
+                           context_schedule="always", history_scope="full"):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -139,6 +143,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     donor_prefill_seconds = 0.
     reader = getattr(draft, "memory_reader", None)
     visual_control = draft is not None and getattr(draft, "visual_kv", None) is not None
+    if (context_schedule != "always" or history_scope != "full") and not visual_control and draft is not None:
+        raise ValueError("context schedules require a trained visual-KV/history interface")
     visual_cache = None
     visual_donor = None
     if visual_control and memory_example is not None:
@@ -180,7 +186,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         from .visual_kv import VisualKVCache
         memory_started = clock(device)
         visual_cache = VisualKVCache(draft, target, output, inputs, donor=visual_donor,
-            disable=disable_memory, reset_state=reset_visual_state)
+            disable=disable_memory, reset_state=reset_visual_state,
+            context_schedule=context_schedule, history_scope=history_scope)
         memory_build_seconds = clock(device)-memory_started
         visual_donor = None
         if memory_example is not None:
@@ -196,6 +203,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         timeline = DecodeTimeline(device)
     blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
     peak_snapshot_bytes = 0
+    round_diagnostics = []
     while emitted < max_new_tokens:
         if draft is None:
             if timeline: timeline.mark("emit")
@@ -218,6 +226,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 if timeline: timeline.mark("target_verify")
                 # Correctness control only, still batched across B replicas.
                 states, predictions = [], []
+                verified_hits = []
                 for index in range(candidates.shape[1]):
                     output = target(input_ids=candidates[:, index:index+1], past_key_values=cache,
                                     use_cache=True, output_hidden_states=True, logits_to_keep=1)
@@ -225,6 +234,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                     target_calls += 1
                     states.append(output.hidden_states)
                     predictions.append(output.logits[:, -1:].argmax(-1))
+                    if index + 1 < candidates.shape[1]:
+                        verified_hits.append(bool(torch.equal(candidates[:, index+1:index+2], predictions[-1])))
                     if index + 1 == candidates.shape[1] or not torch.equal(candidates[:, index+1:index+2], predictions[-1]):
                         break
                 kept = len(states)
@@ -251,7 +262,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 target_calls += 1
                 if timeline: timeline.mark("acceptance")
                 predictions = output.logits.argmax(-1)
-                accepted = (candidates[:, 1:] == predictions[:, :-1]).cumprod(1).sum(1)
+                match = candidates[:, 1:] == predictions[:, :-1]
+                verified_hits = match[0].detach().clone()
+                accepted = match.cumprod(1).sum(1)
                 kept = int(accepted.min()) + 1
                 if transaction is not None:
                     if timeline: timeline.mark("state_select" if state_mode == "per_token" else "gdn_state_replay")
@@ -288,6 +301,13 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             if baseline:
                 history.commit(draft, output, kept)
             del output
+            round_diagnostics.append(dict(
+                round_index=len(round_diagnostics), decode_offset=emitted,
+                first_candidate_hit=verified_hits[0] if len(verified_hits) else None,
+                verified_candidate_hits=verified_hits, committed_length=kept,
+                candidate_count=candidates.shape[1]-1,
+                # Later block hits condition on candidate prefixes, not the AR trace.
+                comparison_scope="candidate_conditioned_target"))
             anchor += kept
             if timeline: timeline.mark("emit")
         # Replicas use the same EOS boundary; assert actual equality after timing.
@@ -309,6 +329,11 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             del output
     if timeline: timeline.mark(None)
     finished = clock(device)
+    # Materialize diagnostic booleans only AFTER the timed CUDA interval.
+    for row in round_diagnostics:
+        if torch.is_tensor(row["verified_candidate_hits"]):
+            row["verified_candidate_hits"] = row["verified_candidate_hits"].tolist()
+        row["first_candidate_hit"] = row["verified_candidate_hits"][0] if row["verified_candidate_hits"] else None
     tokens = torch.cat(blocks, 1)
     if not torch.equal(tokens, tokens[:1].expand_as(tokens)):
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")
@@ -319,6 +344,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         prefill_seconds=prefill_end-started, decode_seconds=finished-prefill_end,
         total_seconds=finished-started, target_decode_calls=target_calls,
         recovery_replays=replays, replicas_identical=True,
+        round_diagnostics=round_diagnostics, context_schedule=context_schedule, history_scope=history_scope,
         cache_policy="preallocated_attention_kv_recurrent_snapshot_and_prefix_replay",
         verification=verification, state_mode=state_mode,
         gdn_verify_backend="native_hf" if transaction is None else
@@ -330,9 +356,11 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     if visual_control:
         result.update(experiment_name=draft.config.dlite_config['experiment_name'],
             reset_visual_state=reset_visual_state,
+            retained_evidence_tokens=int(visual_cache.evidence.valid[0].sum()) if visual_cache.evidence is not None else 0,
             draft_parameters=sum(p.numel() for p in draft.parameters()))
     if transaction:
         result["cache_policy"] = "preallocated_attention_kv_" + state_mode
     if timeline:
         result['profile'] = timeline.resolve(result['decode_seconds'])
     return result
+

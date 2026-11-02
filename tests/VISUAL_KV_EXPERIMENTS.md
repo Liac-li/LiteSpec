@@ -118,8 +118,10 @@ Default six static groups, global batch 64. Data validation fixes the eligible s
 once and later groups reuse it. Each group is independently trained with the same
 seed, backbone initialization and sampling rules; no checkpoints are silently
 reused. Use `EXPERIMENTS="pivot_parallel pivot_rnn"` to select named groups.
-The launcher preserves upstream loss/optimizer settings. Default save-training-state
-is on. Resume with the original configuration and `RESUME=1`; changing debug caps,
+The launcher preserves upstream loss/optimizer settings. Default `SAVE_TRAINING_STATE=0` exports model weights only, with no
+`training_state_rank_*` files. Set `SAVE_TRAINING_STATE=1` explicitly if exact
+resumption is needed. Resume a resumable checkpoint with the original
+configuration and `RESUME=1`; changing debug caps,
 world size or data is rejected by the existing runner.
 
 ## Dynamic three-group training in the same group
@@ -175,3 +177,4 @@ Teacher-forced CE uses the fixed reference tokens, not the sampled proposal pref
 Agreement after the first proposal mismatch is reference-position agreement only,
 not actual counterfactual Target verification. The continuous prefix remains a
 valid fixed-prefix diagnostic. This probe is not a throughput benchmark.
+

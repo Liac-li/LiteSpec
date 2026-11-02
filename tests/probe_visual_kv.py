@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import replace
 import json
+import random
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -31,24 +32,14 @@ def append_reference(example, tokens):
     return inputs
 
 
-def compare(teacher, conditions):
-    off = conditions["disabled"]["tokens"]
-    ref = torch.tensor(teacher)
-    base = torch.tensor(off) == ref
-    for condition, row in conditions.items():
-        hit = torch.tensor(row["tokens"]) == ref
-        row.update(
-            reference_hits=hit.tolist(),
-            reference_committed_length=1 + int(hit.long().cumprod(0).sum()),
-            repairs=int((hit & ~base).sum()),
-            breaks=int((~hit & base).sum()),
-            first_rejection_repaired=(
-                bool(hit[int(base.long().cumprod(0).sum())])
-                if not base.all()
-                else False
-            ),
-        )
-    return conditions
+from visual_diagnostic_metrics import compare_conditions as compare, summarize_probes
+
+
+def scoped_evidence(evidence, history_scope):
+    if history_scope == "prefill":
+        return replace(evidence, valid=evidence.valid & (
+            evidence.positions < evidence.decode_start[:, None]))
+    return evidence
 
 
 @torch.no_grad()
@@ -58,6 +49,10 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--data", required=True, type=Path)
     p.add_argument("--output-dir", required=True, type=Path)
+    p.add_argument("--reference-file", type=Path, help="AR JSONL from same frozen snapshot")
+    p.add_argument("--history-scope", choices=["full", "prefill"], default="full")
+    p.add_argument("--context-schedules", nargs="+", choices=["always", "first_round", "off"], default=["always", "first_round", "off"])
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--samples", type=int, default=16)
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--stride", type=int, default=8)
@@ -87,7 +82,27 @@ def main():
     )
     cfg.update(num_anchors=1, block_size=draft.block_size)
     online = aligned.make_online(target, draft, cfg)
+    mode = draft.config.dlite_config["context_mode"]
+    if args.history_scope == "prefill" and mode != "pivot_history":
+        p.error("prefill scope requires a trained pivot_history checkpoint")
     records = list(read_records(args.data, args.samples))
+    reference_rows = None
+    if args.reference_file:
+        reference_rows = [json.loads(line) for line in args.reference_file.read_text().splitlines() if line.strip()]
+        if [r["sample_id"] for r in reference_rows] != [r["id"] for r in records]:
+            raise ValueError("AR reference IDs/order differ from snapshot")
+    def get_reference(index, example):
+        if reference_rows is not None:
+            return reference_rows[index]["result"]["token_ids"][:args.max_new_tokens]
+        with RequestPositionState(target).activate():
+            return generate_static_batch(target, None, example,
+                max_new_tokens=args.max_new_tokens)["token_ids"]
+    rng = random.Random(args.seed)
+    donors = {}
+    for record in records:
+        choices = [r for r in records if r.get("image") and r["image"] != record.get("image")]
+        if record.get("image") and choices:
+            donors[record["id"]] = rng.choice(choices)
     rows = []
     with (args.output_dir / "anchors.jsonl").open("w") as log:
         for index, record in enumerate(records):
@@ -99,10 +114,7 @@ def main():
                 training=False,
                 base_dir=args.data.parent,
             )
-            with RequestPositionState(target).activate():
-                reference = generate_static_batch(
-                    target, None, example, max_new_tokens=args.max_new_tokens
-                )["token_ids"]
+            reference = get_reference(index, example)
             if len(reference) < draft.block_size:
                 continue
             inputs = append_reference(example, reference)
@@ -127,6 +139,7 @@ def main():
             evidence = gather_evidence(
                 output.hidden_states, draft, inputs["input_ids"], prompt, target.config
             )
+            evidence = scoped_evidence(evidence, args.history_scope)
             donor_info = None
             wrong = None
             options = [
@@ -140,7 +153,7 @@ def main():
                 and draft.config.dlite_config["context_mode"]
                 not in {"pivot", "pivot_history"}
             ):
-                donor = options[index % len(options)]
+                donor = donors[record["id"]]
                 donor_example = prepare_example(
                     processor,
                     target.config,
@@ -203,6 +216,10 @@ def main():
                         contexts["wrong_state"] = replace(
                             evidence, state_override=state
                         )
+                for schedule in args.context_schedules:
+                    contexts["schedule_"+schedule] = (
+                        contexts["correct"] if schedule == "always" or
+                        (schedule == "first_round" and anchor == start) else None)
                 conditions = {}
                 for condition, bank in contexts.items():
                     batch.context_evidence = bank
@@ -229,6 +246,7 @@ def main():
                     id=record["id"],
                     anchor=anchor,
                     decode_offset=anchor - start,
+                    history_scope=args.history_scope,
                     donor=donor_info,
                     reference_tokens=teacher,
                     conditions=compare(teacher, conditions),
@@ -236,27 +254,7 @@ def main():
                 rows.append(row)
                 log.write(json.dumps(row) + "\n")
                 log.flush()
-    summary = {}
-    for row in rows:
-        for condition, values in row["conditions"].items():
-            dest = summary.setdefault(
-                condition,
-                dict(
-                    anchors=0,
-                    reference_committed_length=0,
-                    repairs=0,
-                    breaks=0,
-                    first_rejection_repaired=0,
-                    teacher_forced_ce=0,
-                ),
-            )
-            dest["anchors"] += 1
-            for key in dest:
-                if key != "anchors":
-                    dest[key] += values[key]
-    for row in summary.values():
-        for key in ("reference_committed_length", "teacher_forced_ce"):
-            row[key] /= row["anchors"]
+    summary = summarize_probes(rows)
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (args.output_dir / "settings.json").write_text(
         json.dumps(vars(args), default=str, indent=2)
@@ -266,3 +264,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

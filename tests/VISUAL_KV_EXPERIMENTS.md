@@ -118,9 +118,11 @@ Default six static groups, global batch 64. Data validation fixes the eligible s
 once and later groups reuse it. Each group is independently trained with the same
 seed, backbone initialization and sampling rules; no checkpoints are silently
 reused. Use `EXPERIMENTS="pivot_parallel pivot_rnn"` to select named groups.
-The launcher preserves upstream loss/optimizer settings. Default save-training-state
-is on. Resume with the original configuration and `RESUME=1`; changing debug caps,
-world size or data is rejected by the existing runner.
+The launcher preserves upstream loss/optimizer settings. Per-rank optimizer/RNG
+state is not saved by default; inference weights are still exported. Full training
+resume requires explicitly setting `SAVE_TRAINING_STATE=1` before training. For such
+checkpoints, resume with the original configuration and `RESUME=1`; changing debug
+caps, world size or data is rejected by the existing runner.
 
 ## Dynamic three-group training in the same group
 

@@ -501,12 +501,35 @@ class Qwen3DLiteAttention(nn.Module):
             else None
         )
 
+    def project_context_kv(
+        self,
+        target_hidden: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project fixed conditioning once per physical layer and draft forward.
+
+        This is an autograd-connected temporary, never a persistent history cache.
+        Query/block KV still change on every recurrent application of the layer.
+        """
+        bsz, ctx_len = target_hidden.shape[:2]
+        k = self.k_norm(
+            self.k_proj(target_hidden).view(bsz, ctx_len, -1, self.head_dim)
+        ).transpose(1, 2)
+        v = self.v_proj(target_hidden).view(
+            bsz, ctx_len, -1, self.head_dim
+        ).transpose(1, 2)
+        cos, sin = position_embeddings
+        cos = cos[:, :ctx_len].unsqueeze(1)
+        sin = sin[:, :ctx_len].unsqueeze(1)
+        return k * cos + rotate_half(k) * sin, v
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        projected_context_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -515,22 +538,29 @@ class Qwen3DLiteAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
         cos, sin = position_embeddings
 
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if projected_context_kv is None:
+            # Preserve the original single-pass path for existing checkpoints.
+            k_ctx = self.k_proj(target_hidden)
+            v_ctx = self.v_proj(target_hidden)
+            k = torch.cat([k_ctx, k_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            )
+            v = torch.cat([v_ctx, v_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            ).transpose(1, 2)
+            k = self.k_norm(k).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            k = self.k_norm(k_noise.view(bsz, q_len, -1, self.head_dim)).transpose(1, 2)
+            v = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            k = torch.cat([projected_context_kv[0], k], dim=2)
+            v = torch.cat([projected_context_kv[1], v], dim=2)
 
         if self.config._attn_implementation == "flex_attention":
             # Call FlexAttention directly.  Transformers requests LSE during
@@ -633,6 +663,11 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 f"{type(self).__name__} requires its own architecture/config"
             )
         dlite_config = method_config(config)
+        self.num_loops = dlite_config.get("num_loops", 1)
+        if (not isinstance(self.num_loops, int) or isinstance(self.num_loops, bool)
+                or self.num_loops < 1):
+            raise ValueError("dlite_config.num_loops must be a positive integer")
+        dlite_config["num_loops"] = self.num_loops
         architecture_version = dlite_config.get(
             "architecture_version", DLITE_ARCHITECTURE_VERSION
         )
@@ -1200,8 +1235,13 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         history_hidden: Optional[torch.Tensor] = None,
         shared_history: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.LongTensor] = None,
+        num_loops: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
+        loops = self.num_loops if num_loops is None else num_loops
+        if (not isinstance(loops, int) or isinstance(loops, bool)
+                or not 1 <= loops <= self.num_loops):
+            raise ValueError(f"num_loops must be an integer in [1, {self.num_loops}]")
         hidden_states = noise_embedding
         if shared_history is not None:
             if target_hidden is None or target_hidden.ndim != 4:
@@ -1225,15 +1265,26 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         # Qwen3RotaryEmbedding only reads x.device and x.dtype. Passing the
         # existing activation avoids allocating a dense (B, KV_LEN, H) dummy;
         position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                target_hidden=target_hidden,
-                attention_mask=attention_mask,
-                position_ids=draft_pos_ids,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+        projected = (
+            [layer.self_attn.project_context_kv(target_hidden, position_embeddings)
+             for layer in self.layers]
+            if loops > 1 else None
+        )
+        # Raw hidden is carried between loops; normalize only the final exit.
+        # The sequential RNN head is called by the existing caller, once.
+        for _ in range(loops):
+            for index, layer in enumerate(self.layers):
+                layer_kwargs = dict(kwargs)
+                if projected is not None:
+                    layer_kwargs["projected_context_kv"] = projected[index]
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    target_hidden=target_hidden,
+                    attention_mask=attention_mask,
+                    position_ids=draft_pos_ids,
+                    position_embeddings=position_embeddings,
+                    **layer_kwargs,
+                )
         return self.norm(hidden_states)
 
     def sample_draft_tokens(

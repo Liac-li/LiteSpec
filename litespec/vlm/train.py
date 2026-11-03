@@ -50,6 +50,7 @@ def make_draft(target, processor, cfg):
     config.dlite_config = dict(
         architecture_version="dlite_v2", model_role=role, chs_num_layers=len(layers),
         target_layer_ids=layers, sequential_head="rnn", sequential_rank=cfg.get("sequential_rank", 64),
+        num_loops=cfg.get("num_loops", 1),
         mask_token_id=mask_id,
     )
     if role == "swa_teacher":

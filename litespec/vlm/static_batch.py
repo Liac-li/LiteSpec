@@ -144,7 +144,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     if profile:
         from .inference_profile import DecodeTimeline
         timeline = DecodeTimeline(device)
-    blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
+    blocks, lengths, proposal_spans, emitted, replays, target_calls = [], [], [], 0, 0, 0
     peak_snapshot_bytes = 0
     while emitted < max_new_tokens:
         if draft is None:
@@ -243,6 +243,10 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         emitted += actual
         if draft is not None:
             lengths.append(actual)
+            # Candidate opportunities after the known anchor. Censor output-cap
+            # positions and positions after an emitted EOS, rather than treating
+            # unobservable proposals as rejections in per-position statistics.
+            proposal_spans.append((actual if stop else candidates.shape[1]) - 1)
         if stop or emitted == max_new_tokens:
             break
         if draft is None:
@@ -259,6 +263,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")
     result = dict(token_ids=tokens[0].tolist(), batch_size=batch_size,
         output_tokens=batch_size * emitted, accept_lengths=lengths,
+        proposal_spans=proposal_spans,
         prefill_tokens=example.prefill_length,
         visual_tokens_with_delimiters=int(example.vision_mask.sum()),
         prefill_seconds=prefill_end-started, decode_seconds=finished-prefill_end,

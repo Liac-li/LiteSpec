@@ -80,6 +80,32 @@ forwarded as one batch. It is not continuous batching of distinct requests.
 B=32 high-resolution inputs require enough device memory; choose an explicit
 `--image-max-pixels` limit if needed and use the same limit across methods.
 Effective processor sizes and input token counts are saved by the benchmark.
+
+### Parallel evaluation across GPUs
+
+```bash
+.venv-vlm/bin/python tests/run_dlite_loop.py eval \
+  --run-dir "$LOOP_RUN" \
+  --result-dir "$LOOP_RUN/evaluation_multigpu_$(date +%Y%m%d_%H%M%S)" \
+  --gpus 0,1,2,3,4,5 --batch-sizes 1 32 --state-mode per_token
+```
+
+Use `--gpus` instead of `--gpu`; they are mutually exclusive. Each GPU runs at
+most one independent dataset process at a time. With fewer GPUs than datasets,
+the next dataset starts on whichever GPU becomes free. Each task runs its own
+AR plus every requested loop exit and batch size on the **same** device, so AR
+ratios never combine timings from different GPUs. Every B=32 batch still runs
+on one GPU. This shortens total evaluation time; it is not tensor parallelism or
+a measurement of multi-GPU serving throughput.
+
+The parent prints dataset start/completion messages; detailed output is in
+`<result-dir>/<dataset>.log`. `queue_status.json` records dataset/device/PID,
+status, command and exit code. Only the parent writes the aggregate reports,
+after workers stop, so it never reads another worker's actively written JSON.
+On a task failure or Ctrl-C, active workers are stopped, pending jobs remain
+unstarted, and completed dataset results are preserved and aggregated. The
+manual `report` command also respects queue status and skips unfinished datasets.
+No training, model forward, checkpoint weights or generation settings change.
 If the default evaluation directory already exists, use a fresh directory:
 
 ```bash
@@ -118,6 +144,12 @@ performance measurements.
 .venv-vlm/bin/python -m pytest tests/test_dlite_loop.py \
   tests/test_vlm.py tests/test_vlm_aligned.py tests/test_vlm_batch_training.py \
   tests/test_vlm_static_batch.py -q
+```
+
+The scheduling tests need no GPU, Torch or Transformers:
+
+```bash
+.venv-vlm/bin/python -m unittest discover -s tests -p test_dlite_loop_queue.py -v
 ```
 
 Tests cover unrolled output/gradient equivalence, shared projection call counts,

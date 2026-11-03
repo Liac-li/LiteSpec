@@ -3,12 +3,15 @@
 Run with the existing .venv-vlm Python. This does not install dependencies.
 """
 import argparse
+from collections import deque
 import csv
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 import yaml
 
@@ -44,6 +47,111 @@ def environment(gpus):
     env.setdefault("OMP_NUM_THREADS", "1")
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
+
+
+def evaluation_gpu_ids(value):
+    items = [item.strip() for item in value.split(",")]
+    if not items or any(not item.isdecimal() for item in items):
+        raise ValueError("evaluation GPUs must be distinct nonnegative IDs separated by commas")
+    ids = [str(int(item)) for item in items]
+    if len(ids) != len(set(ids)):
+        raise ValueError("evaluation GPUs must be distinct nonnegative IDs separated by commas")
+    return ids
+
+
+def run_evaluation_jobs(jobs, gpus, result_dir, *, dry_run=False):
+    """Run one independent dataset process per GPU; parent owns queue status.
+
+    Every dataset task includes its own same-device AR and all fixed exits.
+    Children exclusively own their dataset result directories and log files.
+    """
+    pending, active = deque(jobs), {}
+    states = {name: dict(dataset=name, status="pending", gpu=None, pid=None, returncode=None,
+                         command=[str(item) for item in command]) for name, command in jobs}
+    status_path = result_dir/"queue_status.json"
+
+    def save_status():
+        temporary = status_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(dict(gpus=gpus, dry_run=dry_run, jobs=list(states.values())), indent=2))
+        temporary.replace(status_path)
+
+    if dry_run:
+        for index, (name, command) in enumerate(jobs):
+            gpu = gpus[index % len(gpus)]
+            states[name].update(status="planned", gpu=gpu)
+            print(f"PLAN {name}: GPU={gpu}", flush=True)
+            print("RUN " + json.dumps([str(item) for item in command]), flush=True)
+        save_status()
+        return list(states.values())
+
+    def stop_process(process):
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait()
+
+    save_status()
+    try:
+        while pending or active:
+            for gpu in gpus:
+                if gpu in active or not pending:
+                    continue
+                name, command = pending.popleft()
+                log_path = result_dir/f"{name}.log"
+                log = log_path.open("w")
+                try:
+                    process = subprocess.Popen([str(item) for item in command], cwd=ROOT,
+                        env=environment(gpu), stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=os.name == "posix")
+                except BaseException as error:
+                    log.close()
+                    states[name].update(status="failed", gpu=gpu, error=str(error))
+                    save_status()
+                    raise
+                active[gpu] = (name, process, log)
+                states[name].update(status="running", gpu=gpu, pid=process.pid, log=str(log_path))
+                save_status()
+                print(f"START {name}: GPU={gpu}, PID={process.pid}; log={log_path}", flush=True)
+            completed = []
+            for gpu, (name, process, log) in active.items():
+                code = process.poll()
+                if code is not None:
+                    completed.append((gpu, name, log, code))
+            failure = None
+            for gpu, name, log, code in completed:
+                log.close()
+                del active[gpu]
+                states[name].update(status="completed" if code == 0 else "failed", returncode=code)
+                save_status()
+                print(f"{'DONE' if code == 0 else 'FAILED'} {name}: GPU={gpu}, exit={code}", flush=True)
+                if code and failure is None:
+                    failure = subprocess.CalledProcessError(code, states[name]["command"])
+            if failure is not None:
+                raise failure
+            if not completed and active:
+                time.sleep(0.1)
+    finally:
+        for gpu, (name, process, log) in active.items():
+            try:
+                stop_process(process)
+            finally:
+                log.close()
+                states[name].update(status="cancelled", returncode=process.poll())
+        save_status()
+    return list(states.values())
 
 
 def train(args):
@@ -92,6 +200,9 @@ def train(args):
 
 
 def evaluate(args):
+    gpus = evaluation_gpu_ids(args.gpus if args.gpus is not None else args.gpu or "0")
+    if args.gpu is not None and len(gpus) != 1:
+        raise ValueError("--gpu selects one device; use --gpus for multiple devices")
     metadata = json.loads((args.run_dir/"experiment.json").read_text())
     if metadata.get("dry_run"):
         raise ValueError("this run contains dry-run plans, not trained checkpoints")
@@ -131,9 +242,9 @@ def evaluate(args):
     (result_dir/"experiment.json").write_text(json.dumps(dict(
         training_run=str(args.run_dir), datasets=args.datasets, batch_sizes=args.batch_sizes,
         state_mode=args.state_mode, samples=args.samples, max_new_tokens=args.max_new_tokens,
-        loop_sweep=args.loop_sweep, exits=exits,
+        loop_sweep=args.loop_sweep, exits=exits, gpus=gpus,
         image_max_pixels=args.image_max_pixels, benchmark="static_replicated_batch"), indent=2))
-    env = environment(args.gpu)
+    scheduled = []
     for name, data, mode in jobs:
         command = [sys.executable, "tests/benchmark_vlm_static_batch.py", "--target-model", target,
                    *checkpoints, *loop_overrides, "--data", data, "--dataset-name", name, "--data-split", "unspecified",
@@ -146,9 +257,17 @@ def evaluate(args):
             command += ["--image-max-pixels", str(args.image_max_pixels)]
         if args.profile:
             command += ["--profile-decode", "--profile-samples", str(min(4, args.samples))]
-        execute(command, result_dir/f"{name}.log", env, dry_run=args.dry_run)
-        if not args.dry_run:
-            report(result_dir)
+        scheduled.append((name, command))
+    try:
+        run_evaluation_jobs(scheduled, gpus, result_dir, dry_run=args.dry_run)
+    finally:
+        # Read only completed datasets, never another child's live summary.
+        status_path = result_dir/"queue_status.json"
+        if not args.dry_run and status_path.is_file():
+            completed = [job["dataset"] for job in json.loads(status_path.read_text())["jobs"]
+                         if job["status"] == "completed"]
+            if completed:
+                report(result_dir, datasets=completed)
     print(f"Evaluation group: {result_dir}", flush=True)
 
 
@@ -167,9 +286,16 @@ def position_counts(records, width=7):
     return hits, trials
 
 
-def report(root):
+def report(root, datasets=None):
     rows, positions = [], []
+    queue = root/"queue_status.json"
+    if datasets is None and queue.is_file():
+        status = json.loads(queue.read_text())
+        if not status.get("dry_run"):
+            datasets = [job["dataset"] for job in status["jobs"] if job["status"] == "completed"]
     for path in sorted(root.glob("*/summary.json")):
+        if datasets is not None and path.parent.name not in datasets:
+            continue
         summaries = json.loads(path.read_text())
         for source in summaries:
             row = dict(dataset=path.parent.name, **source)
@@ -241,7 +367,9 @@ def main(argv=None):
     evaluation.add_argument("--run-dir", type=Path, required=True)
     evaluation.add_argument("--result-dir", type=Path)
     evaluation.add_argument("--target-model", type=Path)
-    evaluation.add_argument("--gpu", default="0")
+    devices = evaluation.add_mutually_exclusive_group()
+    devices.add_argument("--gpu", help="one evaluation GPU; default: 0")
+    devices.add_argument("--gpus", help="comma-separated GPUs, one dataset process per GPU")
     evaluation.add_argument("--batch-sizes", nargs="+", type=positive, default=[1, 32])
     evaluation.add_argument("--datasets", nargs="+", choices=["gsm8k", *VISION_DATASETS], default=["gsm8k", *VISION_DATASETS])
     evaluation.add_argument("--text-data", type=Path, default=home/"LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main-0708-new/eval_datasets/gsm8k.jsonl")
@@ -265,8 +393,14 @@ def main(argv=None):
     if args.action == "train":
         train(args)
     elif args.action == "eval":
-        if len(args.datasets) != len(set(args.datasets)) or len(args.gpu.split(",")) != 1:
-            parser.error("use unique datasets and exactly one --gpu for static batch evaluation")
+        if len(args.datasets) != len(set(args.datasets)):
+            parser.error("use unique datasets")
+        try:
+            ids = evaluation_gpu_ids(args.gpus if args.gpus is not None else args.gpu or "0")
+            if args.gpu is not None and len(ids) != 1:
+                parser.error("--gpu selects one device; use --gpus for multiple devices")
+        except ValueError as error:
+            parser.error(str(error))
         evaluate(args)
     else:
         report(args.result_dir)

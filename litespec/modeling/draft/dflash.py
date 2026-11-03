@@ -333,6 +333,7 @@ class Qwen3DFlashAttentionBase(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        cache_layer_idx: Optional[int] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -340,7 +341,10 @@ class Qwen3DFlashAttentionBase(nn.Module):
         if past_key_values is not None:
             cos, sin = position_embeddings
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+            # Recurrent executions share weights, but each virtual layer owns
+            # its cache. Otherwise a loop appends the same history repeatedly.
+            index = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+            k, v = past_key_values.update(k, v, index, cache_kwargs)
         valid_queries = None
         if self.config._attn_implementation == "flex_attention":
             attn_output = compile_friendly_flex_attention(
@@ -705,6 +709,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.attention_mode = validate_dflash_attention_config(config)
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         draft_config = method_config(config)
+        self.num_loops = draft_config.get("num_loops", 1)
+        if (not isinstance(self.num_loops, int) or isinstance(self.num_loops, bool)
+                or self.num_loops < 1):
+            raise ValueError("num_loops must be a positive integer")
+        if self.num_loops > 1 and type(self).__name__ != "DFlashDraftModel":
+            raise ValueError("recurrent DFlash depth is supported only for DFlashDraftModel")
         block_size = config.block_size
         if not isinstance(block_size, int) or isinstance(block_size, bool):
             raise ValueError("Draft config.block_size must be an integer")
@@ -832,27 +842,36 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         target_hidden: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
+        num_loops: Optional[int] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        loops = self.num_loops if num_loops is None else num_loops
+        maximum = method_config(self.config).get("num_loops", 1)
+        if (not isinstance(loops, int) or isinstance(loops, bool)
+                or not 1 <= loops <= maximum):
+            raise ValueError(f"num_loops must be in [1, {maximum}]")
         hidden_states = noise_embedding
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer_type, layer in zip(self.layer_types, self.layers):
-            layer_attention_mask = (
-                attention_mask[layer_type]
-                if isinstance(attention_mask, dict)
-                else attention_mask
-            )
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                target_hidden=target_hidden,
-                attention_mask=layer_attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                use_cache=use_cache,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+        for repeat in range(loops):
+            for index, (layer_type, layer) in enumerate(zip(self.layer_types, self.layers)):
+                layer_attention_mask = (
+                    attention_mask[layer_type]
+                    if isinstance(attention_mask, dict)
+                    else attention_mask
+                )
+                cache_options = dict(cache_layer_idx=repeat * len(self.layers) + index) if maximum > 1 else {}
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    target_hidden=target_hidden,
+                    attention_mask=layer_attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    use_cache=use_cache,
+                    position_embeddings=position_embeddings,
+                    **cache_options,
+                    **kwargs,
+                )
         return self.norm(hidden_states)
 
     @torch.inference_mode()

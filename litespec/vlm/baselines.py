@@ -43,8 +43,11 @@ def make_draft(target, processor, cfg):
     config.block_size = cfg["block_size"]
     config.sliding_window, config.use_sliding_window = None, False
     config._attn_implementation = "sdpa"
-    layers = cfg.get("target_layer_ids") or build_target_layer_ids(text.num_hidden_layers, cfg["num_draft_layers"])
+    layers = cfg.get("target_layer_ids") or build_target_layer_ids(
+        text.num_hidden_layers, cfg.get("target_context_layers", cfg["num_draft_layers"]))
     method = dict(target_layer_ids=layers, mask_token_id=mask, attention_mode="gqa")
+    if family == "dflash":
+        method["num_loops"] = cfg.get("num_loops", 1)
     if family == "dspark":
         method.update(projector_type="dspark", markov_head_type=cfg["markov_head_type"],
                       markov_rank=cfg["markov_rank"], enable_confidence_head=cfg["confidence_head"],

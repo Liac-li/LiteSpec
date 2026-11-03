@@ -2,6 +2,58 @@
 
 Branch: `research/qwen35-vlm-looped`.
 
+## Six-model, 20k / five-epoch comparison
+
+The launcher also supports three DFlash controls. Select both families and
+override the epoch count explicitly; the original three-model / one-epoch
+defaults remain compatible with existing commands and trained runs.
+
+```bash
+export LOOP_RUN="$PWD/../runs/dlite_dflash_loop_20k_5ep_$(date +%Y%m%d_%H%M%S)"
+.venv-vlm/bin/python tests/run_dlite_loop.py train \
+  --run-dir "$LOOP_RUN" --families dlite dflash --epochs 5 \
+  --max-samples 20000 --gpus 0,1,2,3,4,5,6,7
+
+# Run after all six training jobs finish.
+.venv-vlm/bin/python tests/run_dlite_loop.py eval \
+  --run-dir "$LOOP_RUN" \
+  --result-dir "$LOOP_RUN/evaluation_img1024_$(date +%Y%m%d_%H%M%S)" \
+  --gpus 0,1,2,3,4,5 --batch-sizes 1 32 \
+  --samples 16 --max-new-tokens 256 --state-mode per_token \
+  --image-max-pixels 1048576
+```
+
+Training runs `dlite_5l1r`, `dlite_1l5r`, `dlite_1l3r`, `dflash_5l1r`,
+`dflash_1l5r`, `dflash_1l3r` sequentially, each using all selected GPUs and a
+fresh initialization. It does not continue the old one-epoch checkpoints.
+All six share source records, eligible-set validation, block size, seed, global
+batch and five full epochs. The original per-family objectives and optimizers
+are retained: DLite SFT uses Muon/AdamW with final CE + L1 and 12 CHS layers;
+DFlash uses its upstream AdamW/decayed CE recipe with full target history.
+All three DFlash controls use the same five target feature layers, selected by
+the existing five-layer DFlash rule, even when the physical draft has one layer.
+For a 32-layer target these are `[1, 8, 15, 22, 29]` (zero-based).
+
+DFlash repeats the shared physical backbone on raw hidden states and applies
+the final norm / parallel target LM head only after the last loop. Each virtual
+layer has its own history KV cache, equivalent to an explicitly unrolled model
+with tied weights; this prevents appending a context once per loop into the
+same cache. Unlike DLite, it retains full target-history KV. Weight sharing does
+not imply a proportional reduction in DFlash history-cache memory. Changing
+the inference depth requires a fresh cache; the benchmark creates one per run.
+
+Evaluation reads the model list from the training manifest, includes every fixed
+exit for both families (18 draft settings + AR), and keeps the existing dataset
+per GPU queue and position-acceptance / profiling outputs. Old manifests without
+a model list still evaluate the original three DLite controls. The explicit
+pixel budget limits images to about 1024 image tokens with the Qwen3.5 processor;
+this is a resized-input benchmark, including for HRBench. It avoids the observed
+native-resolution B=32 vision-prefill OOM and must be reported with results.
+The original token-match limitation is unchanged by this training extension;
+check Match before describing throughput ratios as lossless speedups.
+
+## Original DLite pilot
+
 | Label | Physical layers | Loops | Layer applications |
 |---|---:|---:|---:|
 | dlite_5l1r | 5 | 1 | 5 |

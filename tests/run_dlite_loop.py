@@ -1,4 +1,4 @@
-"""Three DLite controls: common-data training and B=1/32 static evaluation.
+"""DLite/DFlash loop controls: common-data training and B=1/32 static evaluation.
 
 Run with the existing .venv-vlm Python. This does not install dependencies.
 """
@@ -17,6 +17,9 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ("dlite_5l1r", "dlite_1l5r", "dlite_1l3r")
+MODEL_SPECS = {f"{family}_{suffix}": (family, layers, loops)
+               for family in ("dlite", "dflash")
+               for suffix, layers, loops in (("5l1r", 5, 1), ("1l5r", 1, 5), ("1l3r", 1, 3))}
 VISION_DATASETS = ("charxiv_val", "flickr30k", "textvqa", "hr_bench_4k", "hr_bench_8k")
 
 
@@ -163,29 +166,32 @@ def train(args):
     gpus = [x.strip() for x in args.gpus.split(",") if x.strip()]
     if not gpus or len(gpus) != len(set(gpus)):
         raise ValueError("--gpus must contain distinct CUDA device IDs")
+    models = [label for label, spec in MODEL_SPECS.items() if spec[0] in args.families]
     args.run_dir.mkdir(parents=True)
     manifest = dict(target_model=str(target), train_data=str(source), max_samples=args.max_samples,
-                    models=list(MODELS), num_epochs=1, block_size=8, seed=42,
+                    models=models, num_epochs=args.epochs, block_size=8, seed=42,
                     chs_num_layers=12, sequential_rank=320, gpus=gpus,
                     micro_batch=args.micro_batch, accumulation=args.accumulation,
                     global_batch=len(gpus)*args.micro_batch*args.accumulation,
                     debug_steps=args.debug_steps, dry_run=args.dry_run)
     (args.run_dir/"experiment.json").write_text(json.dumps(manifest, indent=2))
     env = environment(args.gpus)
-    first = args.run_dir/MODELS[0]
-    for label in MODELS:
-        config = yaml.safe_load((ROOT/"scripts/config/vlm"/f"{label.replace('dlite_', 'dlite_loop_')}.yaml").read_text())
+    first = args.run_dir/models[0]
+    for label in models:
+        family, _, _ = MODEL_SPECS[label]
+        template = label.replace(f"{family}_", f"{family}_loop_", 1)
+        config = yaml.safe_load((ROOT/"scripts/config/vlm"/f"{template}.yaml").read_text())
         output = args.run_dir/label
         output.mkdir()
         config.update(target_model=str(target), train_data=str(source), output_dir=str(output),
                       batch_size=args.micro_batch, accumulation_steps=args.accumulation,
-                      report_to=args.report_to)
+                      num_epochs=args.epochs, report_to=args.report_to)
         path = output/"config.yaml"
         path.write_text(yaml.safe_dump(config, sort_keys=False))
         command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
                    f"--nproc-per-node={len(gpus)}", "-m", "litespec.vlm.train_aligned",
                    "--config", path, "--max-samples", str(args.max_samples)]
-        if label != MODELS[0]:
+        if label != models[0]:
             command += ["--reuse-validation-from", first]
         if args.debug_steps:
             command += ["--max-steps", str(args.debug_steps)]
@@ -213,13 +219,20 @@ def evaluate(args):
     checkpoints = []
     loop_overrides = []
     exits = []
-    for label in MODELS:
+    models = metadata.get("models", list(MODELS))
+    if not models or len(models) != len(set(models)) or any(label not in MODEL_SPECS for label in models):
+        raise ValueError("experiment.json must list unique supported model controls")
+    for label in models:
         checkpoint = args.run_dir/label/"last"
         if not (checkpoint/"config.json").is_file():
             raise FileNotFoundError(checkpoint)
         config = json.loads((checkpoint/"config.json").read_text())
-        expected = dict(zip(MODELS, ((5, 1), (1, 5), (1, 3))))[label]
-        if (config["num_hidden_layers"], config["dlite_config"].get("num_loops", 1)) != expected:
+        family, layers, loops = MODEL_SPECS[label]
+        expected = (layers, loops)
+        architecture = {"dlite": "DLiteDraftModel", "dflash": "DFlashDraftModel"}[family]
+        if config.get("architectures", [architecture]) != [architecture]:
+            raise ValueError(f"wrong checkpoint family for {label}")
+        if (config["num_hidden_layers"], config[family+"_config"].get("num_loops", 1)) != expected:
             raise ValueError(f"wrong checkpoint architecture for {label}")
         depths = range(1, expected[1]+1) if args.loop_sweep and expected[1] > 1 else [expected[1]]
         for depth in depths:
@@ -242,7 +255,7 @@ def evaluate(args):
     (result_dir/"experiment.json").write_text(json.dumps(dict(
         training_run=str(args.run_dir), datasets=args.datasets, batch_sizes=args.batch_sizes,
         state_mode=args.state_mode, samples=args.samples, max_new_tokens=args.max_new_tokens,
-        loop_sweep=args.loop_sweep, exits=exits, gpus=gpus,
+        loop_sweep=args.loop_sweep, models=models, exits=exits, gpus=gpus,
         image_max_pixels=args.image_max_pixels, benchmark="static_replicated_batch"), indent=2))
     scheduled = []
     for name, data, mode in jobs:
@@ -360,6 +373,9 @@ def main(argv=None):
     training.add_argument("--micro-batch", type=positive, default=1)
     training.add_argument("--accumulation", type=positive, default=4)
     training.add_argument("--max-samples", type=positive, default=20000)
+    training.add_argument("--epochs", type=positive, default=1)
+    training.add_argument("--families", nargs="+", choices=["dlite", "dflash"], default=["dlite"],
+                          help="three controls per selected family; select both for six models")
     training.add_argument("--debug-steps", type=positive)
     training.add_argument("--report-to", choices=["none", "tensorboard"], default="tensorboard")
     training.add_argument("--dry-run", action="store_true")

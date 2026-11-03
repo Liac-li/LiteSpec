@@ -21,9 +21,10 @@ from vlm_benchmark_data import read_eval_records
 def set_inference_loops(draft, loops):
     """Select a fixed exit without changing weights or the saved training config."""
     from litespec.modeling.draft.dlite import DLiteDraftModel
-    if not isinstance(draft, DLiteDraftModel):
-        raise ValueError("--checkpoint-loops is supported only for DLite")
-    maximum = draft.config.dlite_config.get("num_loops", 1)
+    from litespec.modeling.draft.dflash import DFlashDraftModel
+    if type(draft) not in (DLiteDraftModel, DFlashDraftModel):
+        raise ValueError("--checkpoint-loops is supported only for DLite and DFlash")
+    maximum = getattr(draft.config, draft.method_config_key).get("num_loops", 1)
     if not isinstance(loops, int) or isinstance(loops, bool) or not 1 <= loops <= maximum:
         raise ValueError(f"inference loops must be in [1, {maximum}]")
     draft.num_loops = loops
@@ -55,7 +56,7 @@ def main():
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--checkpoint-loops", nargs=2, action="append", default=[], metavar=("LABEL", "DEPTH"),
-                        help="fixed DLite inference depth for this checkpoint label; repeat per label")
+                        help="fixed DLite/DFlash inference depth for this checkpoint label; repeat per label")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
     parser.add_argument("--dataset-name", default="unspecified")
@@ -108,9 +109,11 @@ def main():
         except ValueError:
             parser.error("--checkpoint-loops DEPTH must be an integer")
         config = json.loads((Path(dict(checkpoints)[label])/"config.json").read_text())
-        maximum = config.get("dlite_config", {}).get("num_loops", 1)
-        if config.get("architectures") != ["DLiteDraftModel"] or not 1 <= depth <= maximum:
-            parser.error(f"--checkpoint-loops {label} requires DLite depth in [1, {maximum}]")
+        method_key = {"DLiteDraftModel": "dlite_config", "DFlashDraftModel": "dflash_config"}.get(
+            (config.get("architectures") or [None])[0])
+        maximum = config.get(method_key, {}).get("num_loops", 1)
+        if method_key is None or not 1 <= depth <= maximum:
+            parser.error(f"--checkpoint-loops {label} requires DLite/DFlash depth in [1, {maximum}]")
         loop_overrides[label] = depth
     data = args.data.expanduser().resolve()
     inspection = None
@@ -213,7 +216,7 @@ def main():
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
                 physical_layers=draft.config.num_hidden_layers if draft is not None else None,
-                trained_num_loops=getattr(draft.config, "dlite_config", {}).get("num_loops", 1) if draft is not None else None,
+                trained_num_loops=getattr(draft.config, draft.method_config_key, {}).get("num_loops", 1) if draft is not None else None,
                 inference_num_loops=getattr(draft, "num_loops", 1) if draft is not None else None,
                 dataset_path=str(data), dataset_name=args.dataset_name,
                 input_mode=args.input_mode if args.reference_input else "from_manifest",

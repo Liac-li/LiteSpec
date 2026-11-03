@@ -55,8 +55,8 @@ def load_config(path):
     loops = cfg.get("num_loops", 1)
     if not isinstance(loops, int) or isinstance(loops, bool) or loops < 1:
         raise ValueError("num_loops must be a positive integer")
-    if family != "dlite" and loops != 1:
-        raise ValueError("VLM recurrent depth is currently supported only for DLite")
+    if family not in {"dlite", "dflash"} and loops != 1:
+        raise ValueError("VLM recurrent depth is supported only for DLite and DFlash")
     if not isinstance(cfg.get("batch_size"), int) or isinstance(cfg["batch_size"], bool) or cfg["batch_size"] < 1:
         raise ValueError("batch_size must be a positive integer")
     if cfg.get("model_role", "student") != "student":

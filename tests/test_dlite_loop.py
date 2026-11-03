@@ -203,8 +203,13 @@ def test_evaluation_dispatches_three_checkpoints_and_reports(tmp_path, capsys):
     main(["eval", "--run-dir", str(run), "--datasets", "gsm8k", "textvqa",
           "--text-data", str(text), "--data-dir", str(data), "--dry-run"])
     commands = capsys.readouterr().out
-    for label in MODELS:
+    aliases = [MODELS[0], *[f"{MODELS[1]}_loop{n}" for n in range(1, 6)],
+               *[f"{MODELS[2]}_loop{n}" for n in range(1, 4)]]
+    for label in aliases:
         assert commands.count(f'"--checkpoint", "{label}"') == 2
+        assert commands.count(f'"--checkpoint-loops", "{label}"') == 2
+    settings = json.loads((run/"evaluation/experiment.json").read_text())
+    assert [e["inference_num_loops"] for e in settings["exits"]] == [1, 1, 2, 3, 4, 5, 1, 2, 3]
     assert commands.count('"--batch-sizes", "1", "32"') == 2
     assert commands.count('"--profile-decode"') == 2
     assert commands.count('"--reference-input"') == 1  # vision only; GSM8K uses existing text reader
@@ -226,3 +231,67 @@ def test_evaluation_dispatches_three_checkpoints_and_reports(tmp_path, capsys):
     assert positions[0]["prefix_acceptance"] == 1
     assert positions[1]["prefix_acceptance"] == 0
     assert positions[6]["prefix_acceptance"] is None
+
+
+def test_fixed_exit_benchmark_runs_requested_depths_without_editing_checkpoint(monkeypatch, tmp_path):
+    import sys
+    import benchmark_vlm_static_batch as cli
+    from test_vlm_aligned import Processor
+    target = tiny_qwen35().requires_grad_(False)
+    checkpoint = tmp_path/"draft"
+    model(5).save_pretrained(checkpoint)
+    config_before = (checkpoint/"config.json").read_bytes()
+    data = tmp_path/"eval.jsonl"
+    data.write_text(json.dumps(dict(id="one", question="describe"))+"\n")
+    monkeypatch.setattr(cli, "load_target", lambda *a, **kw: (target, Processor()))
+    seen = []
+    generate = cli.generate_static_batch
+    def observe(target, draft, example, **kwargs):
+        if draft is not None:
+            assert draft.config.dlite_config["num_loops"] == 5
+            seen.append((draft.num_loops, kwargs["batch_size"]))
+        return generate(target, draft, example, **kwargs)
+    monkeypatch.setattr(cli, "generate_static_batch", observe)
+    arguments = ["benchmark", "--target-model", "tiny", "--data", str(data),
+                 "--output-dir", str(tmp_path/"results"), "--batch-sizes", "1", "32",
+                 "--max-samples", "1", "--max-new-tokens", "3", "--warmup", "0", "--device", "cpu"]
+    for depth in (1, 3, 5):
+        arguments += ["--checkpoint", f"exit{depth}", str(checkpoint), "--checkpoint-loops", f"exit{depth}", str(depth)]
+    monkeypatch.setattr(sys, "argv", arguments)
+    cli.main()
+    assert seen == [(depth, batch) for depth in (1, 3, 5) for batch in (1, 32)]
+    summaries = json.loads((tmp_path/"results/summary.json").read_text())
+    assert len(summaries) == 8
+    for row in summaries:
+        if row["model"] == "ar":
+            assert row["inference_num_loops"] is None
+        else:
+            assert row["inference_num_loops"] == int(row["model"][-1])
+            assert row["trained_num_loops"] == 5 and row["physical_layers"] == 1
+            assert (tmp_path/"results"/f"{row['model']}_b{row['batch_size']}.jsonl").is_file()
+    assert (checkpoint/"config.json").read_bytes() == config_before
+
+
+@pytest.mark.parametrize("depth", [0, 6, -1, True, 2.5])
+def test_benchmark_rejects_invalid_exit_depth(depth):
+    from benchmark_vlm_static_batch import set_inference_loops
+    with pytest.raises(ValueError, match="inference loops"):
+        set_inference_loops(model(5), depth)
+
+
+def test_final_exit_only_remains_available(tmp_path, capsys):
+    run = tmp_path/"trained"
+    run.mkdir()
+    (run/"experiment.json").write_text(json.dumps(dict(target_model="tiny")))
+    for label, (layers, loops) in zip(MODELS, ((5, 1), (1, 5), (1, 3))):
+        checkpoint = run/label/"last"
+        checkpoint.mkdir(parents=True)
+        (checkpoint/"config.json").write_text(json.dumps(dict(num_hidden_layers=layers, dlite_config=dict(num_loops=loops))))
+    text = tmp_path/"gsm8k.jsonl"
+    text.write_text('{"turns":["question"]}\n')
+    main(["eval", "--run-dir", str(run), "--datasets", "gsm8k", "--text-data", str(text),
+          "--dry-run", "--no-loop-sweep"])
+    command = capsys.readouterr().out
+    assert "_loop1\"" not in command
+    for label in MODELS:
+        assert command.count(f'"--checkpoint", "{label}"') == 1

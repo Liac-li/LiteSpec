@@ -18,6 +18,17 @@ from litespec.vlm.static_batch import generate_static_batch
 from vlm_benchmark_data import read_eval_records
 
 
+def set_inference_loops(draft, loops):
+    """Select a fixed exit without changing weights or the saved training config."""
+    from litespec.modeling.draft.dlite import DLiteDraftModel
+    if not isinstance(draft, DLiteDraftModel):
+        raise ValueError("--checkpoint-loops is supported only for DLite")
+    maximum = draft.config.dlite_config.get("num_loops", 1)
+    if not isinstance(loops, int) or isinstance(loops, bool) or not 1 <= loops <= maximum:
+        raise ValueError(f"inference loops must be in [1, {maximum}]")
+    draft.num_loops = loops
+
+
 def summarize_batches(results, batch_size):
     tokens = sum(row["output_tokens"] for row in results)
     prefill = sum(row["prefill_seconds"] for row in results)
@@ -43,6 +54,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
+    parser.add_argument("--checkpoint-loops", nargs=2, action="append", default=[], metavar=("LABEL", "DEPTH"),
+                        help="fixed DLite inference depth for this checkpoint label; repeat per label")
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
     parser.add_argument("--dataset-name", default="unspecified")
@@ -86,6 +99,19 @@ def main():
     for label, path in checkpoints:
         if not (Path(path)/"config.json").is_file():
             parser.error(f"missing checkpoint {label}: {path}")
+    loop_overrides = {}
+    for label, value in args.checkpoint_loops:
+        if label not in labels or label in loop_overrides:
+            parser.error("--checkpoint-loops requires a unique existing checkpoint label")
+        try:
+            depth = int(value)
+        except ValueError:
+            parser.error("--checkpoint-loops DEPTH must be an integer")
+        config = json.loads((Path(dict(checkpoints)[label])/"config.json").read_text())
+        maximum = config.get("dlite_config", {}).get("num_loops", 1)
+        if config.get("architectures") != ["DLiteDraftModel"] or not 1 <= depth <= maximum:
+            parser.error(f"--checkpoint-loops {label} requires DLite depth in [1, {maximum}]")
+        loop_overrides[label] = depth
     data = args.data.expanduser().resolve()
     inspection = None
     if args.reference_input:
@@ -102,7 +128,8 @@ def main():
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     settings = {**vars(args), "data": str(data), "output_dir": str(root),
-        "resolved_checkpoints": checkpoints, "sample_ids": [row["id"] for row in records],
+        "resolved_checkpoints": checkpoints, "checkpoint_loop_overrides": loop_overrides,
+        "sample_ids": [row["id"] for row in records],
         "actual_attention_backend": attention,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "benchmark_mode": "static_replicated_batch", "timing_scope": "decode_only_after_prefill",
@@ -153,11 +180,14 @@ def main():
             if [r["sample_id"] for r in records] != [e.sample_id for e in examples]:
                 raise ValueError("AR reference sample order differs")
             references[batch_size] = [r["result"]["token_ids"] for r in records]
+            base = dict(base, physical_layers=None, trained_num_loops=None, inference_num_loops=None)
             rows.append(base)
     print(f"True static replicated batches: {sorted(set(args.batch_sizes))}; attention={attention}", flush=True)
     print("Decode-only throughput; prefill reported separately. No continuous batching. Match does not gate ratios.", flush=True)
     for label, checkpoint in (checkpoints if args.ar_reference else [("ar", None), *checkpoints]):
         draft = load_draft(checkpoint, attn_implementation=attention).to(args.device, dtype).eval() if checkpoint else None
+        if label in loop_overrides:
+            set_inference_loops(draft, loop_overrides[label])
         for batch_size in sorted(set(args.batch_sizes)):
             if draft is not None and args.state_mode != "full_target_replay":
                 from litespec.vlm.gdn_state import warmup_state_kernels
@@ -182,6 +212,9 @@ def main():
             expected = references[batch_size]
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
+                physical_layers=draft.config.num_hidden_layers if draft is not None else None,
+                trained_num_loops=getattr(draft.config, "dlite_config", {}).get("num_loops", 1) if draft is not None else None,
+                inference_num_loops=getattr(draft, "num_loops", 1) if draft is not None else None,
                 dataset_path=str(data), dataset_name=args.dataset_name,
                 input_mode=args.input_mode if args.reference_input else "from_manifest",
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),

@@ -100,6 +100,8 @@ def evaluate(args):
     if result_dir.exists():
         raise ValueError("choose a fresh --result-dir; existing results are never overwritten")
     checkpoints = []
+    loop_overrides = []
+    exits = []
     for label in MODELS:
         checkpoint = args.run_dir/label/"last"
         if not (checkpoint/"config.json").is_file():
@@ -108,7 +110,13 @@ def evaluate(args):
         expected = dict(zip(MODELS, ((5, 1), (1, 5), (1, 3))))[label]
         if (config["num_hidden_layers"], config["dlite_config"].get("num_loops", 1)) != expected:
             raise ValueError(f"wrong checkpoint architecture for {label}")
-        checkpoints += ["--checkpoint", label, checkpoint]
+        depths = range(1, expected[1]+1) if args.loop_sweep and expected[1] > 1 else [expected[1]]
+        for depth in depths:
+            alias = f"{label}_loop{depth}" if args.loop_sweep and expected[1] > 1 else label
+            checkpoints += ["--checkpoint", alias, checkpoint]
+            loop_overrides += ["--checkpoint-loops", alias, str(depth)]
+            exits.append(dict(label=alias, checkpoint=str(checkpoint), trained_num_loops=expected[1],
+                              inference_num_loops=depth, physical_layers=expected[0]))
     jobs = []
     if "gsm8k" in args.datasets:
         if not args.text_data.expanduser().is_file():
@@ -123,11 +131,12 @@ def evaluate(args):
     (result_dir/"experiment.json").write_text(json.dumps(dict(
         training_run=str(args.run_dir), datasets=args.datasets, batch_sizes=args.batch_sizes,
         state_mode=args.state_mode, samples=args.samples, max_new_tokens=args.max_new_tokens,
+        loop_sweep=args.loop_sweep, exits=exits,
         image_max_pixels=args.image_max_pixels, benchmark="static_replicated_batch"), indent=2))
     env = environment(args.gpu)
     for name, data, mode in jobs:
         command = [sys.executable, "tests/benchmark_vlm_static_batch.py", "--target-model", target,
-                   *checkpoints, "--data", data, "--dataset-name", name, "--data-split", "unspecified",
+                   *checkpoints, *loop_overrides, "--data", data, "--dataset-name", name, "--data-split", "unspecified",
                    "--output-dir", result_dir/name, "--batch-sizes", *map(str, args.batch_sizes),
                    "--max-samples", str(args.samples), "--max-new-tokens", str(args.max_new_tokens),
                    "--warmup", "1", "--state-mode", args.state_mode, "--seed", "42", "--cpu-inputs"]
@@ -171,6 +180,7 @@ def report(root):
             hits, trials = position_counts(records)
             for index, (hit, trial) in enumerate(zip(hits, trials)):
                 positions.append(dict(dataset=path.parent.name, model=row["model"], batch_size=row["batch_size"],
+                    inference_num_loops=row.get("inference_num_loops"),
                     draft_position=index, prefix_accepted=hit, eligible=trial,
                     prefix_acceptance=hit/trial if trial else None))
     if not rows:
@@ -185,12 +195,14 @@ def report(root):
                 writer.writerows(values)
     lines = ["# DLite loop comparison", "", "Static replicated inputs; decode-only raw throughput ratios. "
              "B denotes batch size, not block length. Check token matches before claiming lossless speedup.", "",
-             "| Dataset | Model | B | Accepted draft | Committed length | tok/s | Raw ratio / AR | Match | Peak GiB |",
-             "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+             "Each loop label is a separate complete decoding run at that fixed depth, using the same trained checkpoint.", "",
+             "| Dataset | Model | Layers | Loops | B | Accepted draft | Committed length | tok/s | Raw ratio / AR | Match | Peak GiB |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     def fmt(value):
         return "—" if value is None else f"{value:.3f}"
     for row in rows:
-        lines.append(f"| {row['dataset']} | {row['model']} | {row['batch_size']} | "
+        lines.append(f"| {row['dataset']} | {row['model']} | {row.get('physical_layers', '—')} | "
+            f"{row.get('inference_num_loops', '—')} | {row['batch_size']} | "
             f"{fmt(row['mean_accepted_draft_tokens'])} | {fmt(row['mean_committed_length'])} | "
             f"{row['output_tokens_per_second']:.2f} | {row['raw_throughput_speedup_vs_ar']:.3f} | "
             f"{row['matched']}/{row['requests']} | {fmt(row['peak_allocated_gib'])} |")
@@ -240,6 +252,8 @@ def main(argv=None):
     evaluation.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="per_token")
     evaluation.add_argument("--image-max-pixels", type=positive)
     evaluation.add_argument("--profile", action=argparse.BooleanOptionalAction, default=True)
+    evaluation.add_argument("--loop-sweep", action=argparse.BooleanOptionalAction, default=True,
+                            help="evaluate every fixed depth of each loop checkpoint (default: on)")
     evaluation.add_argument("--dry-run", action="store_true")
     reporting = sub.add_parser("report")
     reporting.add_argument("--result-dir", type=Path, required=True)

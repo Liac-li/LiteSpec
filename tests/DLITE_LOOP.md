@@ -60,6 +60,15 @@ the smoke/dry-run directory for the full experiment.
 This evaluates AR and all three exported checkpoints on GSM8K, CharXiv,
 Flickr30k, TextVQA, HRBench-4K and HRBench-8K, with B=1 and B=32, 16 unique
 prompts per dataset, seed 42, greedy decoding and at most 256 new tokens.
+By default, the 1L5R checkpoint is independently evaluated at fixed depths 1–5
+and 1L3R at depths 1–3. Labels are `dlite_1l5r_loop1` ... `dlite_1l5r_loop5`
+and `dlite_1l3r_loop1` ... `dlite_1l3r_loop3`; the baseline remains `dlite_5l1r`.
+This gives nine draft settings plus AR, each tested at B=1 and B=32. These are
+separate full decoding runs, not intermediate token predictions emitted inside
+one decoding run. The same checkpoint weights are reused, and no retraining or
+checkpoint rewriting occurs. Add `--no-loop-sweep` to evaluate only final depths.
+CSV/Markdown results include physical layers, trained maximum loops and actual
+inference loops (the Markdown table shows layers and inference loops).
 Only evaluation prompts/images are passed to the models, never reference answers.
 Dataset and image paths use the existing server defaults; override with
 `--text-data`, `--data-dir`, `--image-root`, and select groups with `--datasets`.
@@ -71,6 +80,13 @@ forwarded as one batch. It is not continuous batching of distinct requests.
 B=32 high-resolution inputs require enough device memory; choose an explicit
 `--image-max-pixels` limit if needed and use the same limit across methods.
 Effective processor sizes and input token counts are saved by the benchmark.
+If the default evaluation directory already exists, use a fresh directory:
+
+```bash
+.venv-vlm/bin/python tests/run_dlite_loop.py eval \
+  --run-dir "$LOOP_RUN" --gpu 7 \
+  --result-dir "$LOOP_RUN/evaluation_loops_$(date +%Y%m%d_%H%M%S)"
+```
 
 Normal throughput is measured without per-stage instrumentation. A separate
 short profile pass (on by default; disable with `--no-profile`) provides draft,

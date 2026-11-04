@@ -668,6 +668,11 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             raise ValueError(
                 f"swa_window_size must be >= 1, got {self.swa_window_size}."
             )
+        self.context_window_size = dlite_config.get("context_window_size", 1)
+        if isinstance(self.context_window_size, bool) or not isinstance(self.context_window_size, int) or self.context_window_size < 1:
+            raise ValueError("context_window_size must be a positive integer")
+        if self.context_window_size > 1 and not self.is_student:
+            raise ValueError("multi-position pivot window requires a student")
         self.chs_num_layers = int(dlite_config["chs_num_layers"])
         self.target_layer_ids = [
             int(value) for value in dlite_config["target_layer_ids"]
@@ -774,7 +779,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
 
     @property
     def condition_slot_count(self) -> int:
-        return self.chs_num_layers
+        return self.chs_num_layers * getattr(self, "context_window_size", 1)
 
     @property
     def is_teacher(self) -> bool:
@@ -856,6 +861,12 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 - origin.unsqueeze(-1)
                 + local_offset
             )
+            if getattr(self, "context_window_size", 1) > 1:
+                k = self.context_window_size
+                context_positions = torch.arange(k, device=anchor_positions.device).repeat_interleave(self.chs_num_layers)
+                context_positions = context_positions.view(1, 1, -1).expand(*anchor_positions.shape, -1)
+                local_tokens = local_tokens + k - 1
+                local_masks = local_masks + k - 1
             draft_positions = torch.cat([local_tokens, local_masks], dim=-1)
         return (
             context_positions.reshape(anchor_positions.shape[0], -1),
@@ -912,15 +923,15 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
     def _apply_chs_depth_embedding(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Add target-layer identity to current CHS hidden states."""
         _, _, num_chs_slots, hidden_size = target_hidden.shape
-        if num_chs_slots != self.chs_num_layers:
+        if num_chs_slots != self.condition_slot_count:
             raise ValueError(
-                f"Expected {self.chs_num_layers} current CHS slots, got {num_chs_slots}."
+                f"Expected {self.condition_slot_count} context slots, got {num_chs_slots}."
             )
         depth_ids = torch.tensor(
-            self.target_layer_ids, device=target_hidden.device, dtype=torch.long
+            self.target_layer_ids * self.context_window_size, device=target_hidden.device, dtype=torch.long
         )
         depth_emb = self.layer_depth_embedding(depth_ids).view(
-            1, 1, self.chs_num_layers, hidden_size
+            1, 1, self.condition_slot_count, hidden_size
         )
         return self.context_norm(target_hidden + depth_emb)
 
@@ -982,9 +993,9 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         target_hidden: torch.Tensor,
     ) -> torch.Tensor:
         """Build current CHS context for inference."""
-        if target_hidden.ndim != 4 or target_hidden.shape[2] != self.chs_num_layers:
+        if target_hidden.ndim != 4 or target_hidden.shape[2] != self.condition_slot_count:
             raise ValueError(
-                f"target_hidden must have shape (B,N,{self.chs_num_layers},H), got "
+                f"target_hidden must have shape (B,N,{self.condition_slot_count},H), got "
                 f"{tuple(target_hidden.shape)}."
             )
         if target_hidden.shape[1] != 1:
@@ -1294,6 +1305,8 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         stochastic_verification_mode = _validate_stochastic_verification_mode(
             stochastic_verification_mode
         )
+        if self.context_window_size > 1:
+            raise ValueError("multi-position checkpoints require the VLM static/video inference adapter")
         self._last_decode_stats = {
             "accept_lengths": [],
             "decode_wall_time": 0.0,

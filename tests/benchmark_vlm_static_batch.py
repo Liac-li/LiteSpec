@@ -41,6 +41,7 @@ def summarize_batches(results, batch_size):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--context-window-size", type=int, help="inference override; omit to use trained window")
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--data", type=Path, required=True)
@@ -69,6 +70,8 @@ def main():
     parser.add_argument("--profile-samples", type=int, default=4)
     parser.add_argument("--profile-kernels", action="store_true", help="additional short torch.profiler trace + Python fallback probe")
     args = parser.parse_args()
+    if args.context_window_size is not None and args.context_window_size < 1:
+        parser.error("positive context-window-size required")
     if args.profile_samples < 1 or (args.profile_kernels and not args.profile_decode):
         parser.error('positive profile-samples required; profile-kernels requires profile-decode')
     if min([args.max_new_tokens, *args.batch_sizes]) < 1 or args.max_samples < (0 if args.reference_input else 1) or args.warmup < 0:
@@ -158,6 +161,9 @@ def main():
     print("Decode-only throughput; prefill reported separately. No continuous batching. Match does not gate ratios.", flush=True)
     for label, checkpoint in (checkpoints if args.ar_reference else [("ar", None), *checkpoints]):
         draft = load_draft(checkpoint, attn_implementation=attention).to(args.device, dtype).eval() if checkpoint else None
+        if draft is not None and args.context_window_size is not None:
+            from litespec.vlm.sw_token import set_window
+            set_window(draft,args.context_window_size)
         for batch_size in sorted(set(args.batch_sizes)):
             if draft is not None and args.state_mode != "full_target_replay":
                 from litespec.vlm.gdn_state import warmup_state_kernels
@@ -187,7 +193,9 @@ def main():
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
                 mean_image_tokens=sum(meta["image_tokens"] for meta in input_metadata)/len(input_metadata),
                 attention_backend=attention, **summarize_batches(results, batch_size))
-            summary.update(state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"],
+            summary.update(context_window_size=getattr(draft,"context_window_size",None),
+                context_slots=getattr(draft,"condition_slot_count",None),
+                state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"],
                 peak_transaction_record_mib=max((r["peak_transaction_record_bytes"] or 0) for r in results)/1024**2)
             base = summary if label == "ar" else next(row for row in rows if row["model"] == "ar" and row["batch_size"] == batch_size)
             summary.update(matched=matched, valid_token_match=matched == summary["requests"],

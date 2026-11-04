@@ -44,6 +44,9 @@ def report(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     workspace = Path.home()/'LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/dllm_vllm/dlite-vlm'
+    parser.add_argument('--context-window-size',type=int,help='inference override; omit to use trained window')
+    parser.add_argument('--checkpoint',nargs=2,action='append',default=[],metavar=('LABEL','PATH'))
+    parser.add_argument('--selection-file',type=Path,help='frozen select_data JSON snapshot')
     parser.add_argument('--workspace', type=Path, default=workspace)
     parser.add_argument('--data-root', type=Path, default=Path.home()/'LMM/liyt/datasets/eval_bench')
     parser.add_argument('--target-model', type=Path, default=Path.home()/'LMM/lmm_model/Qwen3.5-4B')
@@ -64,6 +67,13 @@ def main():
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--inspect-only', action='store_true')
     args = parser.parse_args()
+    if args.context_window_size is not None and args.context_window_size < 1:
+        parser.error('positive context window required')
+    if args.checkpoint:
+        labels=[label for label,_ in args.checkpoint]
+        if len(labels)!=len(set(labels)) or any(label=='ar' or not label or any(not(c.isalnum() or c in '-_') for c in label) for label in labels):
+            parser.error('unique safe checkpoint labels, excluding ar, required')
+        args.models=labels
     if min(args.samples,args.frames,args.max_pixels_per_frame,args.max_new_tokens,*args.batch_sizes) < 1 or args.warmup < 1:
         parser.error('positive budgets and at least one warmup required')
     if args.frames % 2 or args.frames < 2: parser.error('even frame count >= 2 required')
@@ -74,8 +84,17 @@ def main():
     paths = dict(dlite_original=args.original_dlite,
                  dlite_vlm_100k=args.dlite_vlm or old/'dlite/last',
                  dflash_vlm_100k=args.dflash_vlm or old/'dflash/last')
+    if args.checkpoint: paths={label:Path(path) for label,path in args.checkpoint}
     paths = {k: v.expanduser().resolve() for k,v in paths.items() if k in args.models}
-    selected = select_data(args.data_root,args.datasets,args.samples,args.seed)
+    selected = (json.loads(args.selection_file.read_text()) if args.selection_file else
+                select_data(args.data_root,args.datasets,args.samples,args.seed))
+    if set(selected)!=set(args.datasets) or any(len(rows)!=args.samples for rows in selected.values()):
+        parser.error('selection snapshot dataset/sample counts differ')
+    for rows in selected.values():
+        for row in rows:
+            video=Path(row['video']);stat=video.stat()
+            if stat.st_size!=row['video_bytes'] or stat.st_mtime_ns!=row['video_mtime_ns']:
+                raise ValueError(f'video changed after selection: {video}')
     settings = {k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()
                 if k not in {'resume','inspect_only','output_dir'}}
     settings.update(state_mode='per_token', attention='sdpa', greedy=True,
@@ -137,6 +156,9 @@ def main():
         for label in ['ar',*args.models]:
             if all((root/'cells'/f'{dataset}_{label}_b{b}.json').is_file() for b in args.batch_sizes): continue
             draft=None if label=='ar' else load_draft(str(paths[label]),attn_implementation='sdpa').to('cuda',torch.bfloat16).eval()
+            if draft is not None and args.context_window_size is not None:
+                from litespec.vlm.sw_token import set_window
+                set_window(draft,args.context_window_size)
             for batch in args.batch_sizes:
                 cell=root/'cells'/f'{dataset}_{label}_b{batch}.json'
                 if cell.exists(): print(f'Skip completed: {cell.name}',flush=True); continue
@@ -179,6 +201,8 @@ def main():
                     peak_allocated_gib=torch.cuda.max_memory_allocated()/1024**3,
                     mean_input_tokens=sum(m['input_tokens'] for m in metadata)/len(metadata),
                     mean_video_tokens=sum(m['video_tokens'] for m in metadata)/len(metadata),
+                    context_window_size=getattr(draft,'context_window_size',None),
+                    context_slots=getattr(draft,'condition_slot_count',None),
                     state_mode='per_token',benchmark_mode='static_replicated_batch',
                     gdn_verify_backend=results[0]['gdn_verify_backend'])
                 base=summary if label=='ar' else json.loads((root/'cells'/f'{dataset}_ar_b{batch}.json').read_text())['summary']

@@ -118,7 +118,7 @@ def selected_layers(states, ids, depth):
 
 
 def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
-                prefill_length, vision_mask, policy):
+                prefill_length, vision_mask, policy, pivot_keep=None):
     """One block, identical context selection during training and decoding."""
     student = draft.is_student
     if student and not policy.is_empty:
@@ -136,6 +136,15 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
         q_pos = torch.arange(offset, offset + block_size, device=device).view(1, -1).expand(batch_size, -1)
         kwargs = {"history_hidden": pivot.new_empty(batch_size, 1, 0, pivot.size(-1))}
         attention_mask = None
+        if getattr(draft, "context_window_size", 1) > 1:
+            anchors = torch.full((batch_size, 1), anchor, device=device, dtype=torch.long)
+            context_pos, q_pos = draft.build_block_position_ids(
+                anchors, anchors.unsqueeze(-1), torch.ones_like(anchors.unsqueeze(-1), dtype=torch.bool))
+            if pivot_keep is None or pivot_keep.shape != (batch_size, draft.condition_slot_count):
+                raise ValueError("windowed inference requires an explicit valid-slot mask")
+            allowed = torch.cat([pivot_keep, torch.ones(batch_size, block_size, dtype=torch.bool, device=device)], -1)
+            attention_mask = torch.zeros((batch_size, 1, block_size, allowed.size(-1)), device=device, dtype=dtype)
+            attention_mask.masked_fill_(~allowed[:, None, None], torch.finfo(dtype).min)
     else:
         if history is None:
             raise ValueError("teacher requires a history bank")
@@ -175,6 +184,8 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
 @torch.no_grad()
 def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, verification="block"):
     """Greedy chain verification with exact accepted-prefix cache recovery."""
+    if draft is not None and getattr(draft, "context_window_size", 1) > 1:
+        raise ValueError("multi-position windows require generate_static_batch / the video benchmark adapter")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     if verification not in {"block", "sequential"}:

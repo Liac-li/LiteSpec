@@ -21,7 +21,16 @@ def load_draft(path, **kwargs):
     name = config.architectures[0]
     if name not in classes:
         raise ValueError(f"unsupported VLM draft architecture: {name}")
-    return classes[name].from_pretrained(path, **kwargs)
+    loaded = classes[name].from_pretrained(path, **kwargs)
+    draft = loaded[0] if isinstance(loaded, tuple) else loaded
+    # RoPE inverse frequencies are nonpersistent: no safetensors key restores
+    # them after HF's meta/to_empty initialization. Rebuild from the ORIGINAL
+    # checkpoint configuration, outside from_pretrained's loading contexts.
+    if hasattr(draft, "rotary_emb"):
+        with torch.device("cpu"):
+            rotary = type(draft.rotary_emb)(draft.config)
+        draft.rotary_emb = rotary.to(device=next(draft.parameters()).device)
+    return loaded
 
 
 def make_draft(target, processor, cfg):

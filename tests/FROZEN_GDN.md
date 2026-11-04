@@ -19,6 +19,13 @@ original DLite parameters remain frozen. Every export checks a digest of all
 non-Reader state tensors against the loaded baseline. No optimizer/RNG checkpoint
 is saved. These runs intentionally do not support resume.
 
+The shared Draft loader rebuilds nonpersistent RoPE frequency buffers from the
+checkpoint's own configuration after HF loading. They are absent from safetensors
+and can otherwise retain uninitialized storage on affected meta-loading paths.
+This repairs derived buffers without modifying learned weights or the position
+scheme. Regression tests check both frequency buffers, exact weight preservation,
+and zero-Reader predictions against a directly constructed baseline.
+
 | Experiment | CE | Probability L1 | Reader features |
 |---|---:|---:|---|
 | frozen_reader_legacy_loss | 0.1 | 1.0 | content + log-RMS |
@@ -70,12 +77,20 @@ before log-RMS fusion and the zero-initialized output map. This is a numerical
 preflight policy, not a proof of trained-model or lossless decoding equivalence.
 
 Both full-sequence reconstructed states and independently reconstructed SAME-prefix
-states are compared with native prefix caches. The two comparisons help separate
-length-dependent BF16 backbone differences from recurrence reconstruction errors.
+states are compared with native prefix caches. Only the SAME-prefix comparisons
+gate reconstruction correctness under the limits above. Cross-length differences
+are retained as train/inference numerical-drift diagnostics, not tested as if their
+BF16 Target inputs were identical; nonfinite states/readouts still stop the run.
+Input hooks additionally report GDN-layer input drift for both comparisons.
+`cross_length_within_same_prefix_budget:false` remains visible even if the
+same-prefix gate passes. This does NOT establish that training and inference
+states are numerically identical or that their difference has no effect on training.
 All metrics are printed and written to `preflight.json` BEFORE any gate fails;
 the file retains `passed:false` until the entire preflight succeeds. A sparse
 pointwise failure alone no longer stops the run, but systematic/head-local/content
-errors still do. Do not bypass a failing gate or adjust limits merely to pass.
+errors in SAME-prefix reconstruction still do. Do not bypass a failing same-prefix
+gate or adjust limits merely to pass. This replaces the earlier, inappropriate
+gate that applied same-prefix tolerances to full-sequence versus prefix execution.
 
 ## Formal training
 

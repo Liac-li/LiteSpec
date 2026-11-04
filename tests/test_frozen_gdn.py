@@ -29,12 +29,14 @@ def adaptation_fixture(tmp_path, feature='full'):
 def test_frozen_optimizer_preserves_original_and_reloads(tmp_path,feature):
     target,base,draft,cfg,example=adaptation_fixture(tmp_path,feature)
     torch.manual_seed(7)
-    plain=aligned.prepare_forward(target,aligned.make_online(target,base,cfg),example)
-    torch.manual_seed(7)
     inputs=aligned.prepare_forward(target,aligned.make_online(target,draft,cfg),example)
     online=aligned.make_online(target,draft,cfg)
-    expected=aligned.make_online(target,base,cfg)(**plain).loss
-    torch.testing.assert_close(online(**inputs).loss,expected)
+    # Zero-init identity must compare the SAME Target execution/anchor features,
+    # not numerical differences between two independently executed Target passes.
+    base.eval().requires_grad_(False)
+    with torch.no_grad():
+        expected=aligned.make_online(target,base,cfg)(**{**inputs,'gdn_states':None}).loss
+        torch.testing.assert_close(online(**inputs).loss,expected)
     parameters,specs=aligned.register_optimizer_parameters(draft)
     assert all('.gdn_reader.' in s.name and s.optimizer=='adamw' for s in specs)
     optimizer=aligned.BF16Optimizer(draft,.0001,weight_decay=0,max_grad_norm=1,total_steps=4,
@@ -95,6 +97,24 @@ def test_pretrained_architecture_wins_over_recipe_defaults(tmp_path):
     assert cfg['num_draft_layers']==1 and cfg['chs_num_layers']==2
     assert cfg['sequential_rank']==8 and draft.mask_token_id==base.mask_token_id
     assert frozen_digest(draft.state_dict())==frozen_digest(base.state_dict())
+
+
+def test_load_rebuilds_nonpersistent_rope_without_touching_weights(monkeypatch,tmp_path):
+    target,base,_,cfg,_=adaptation_fixture(tmp_path)
+    cls=type(base)
+    original=cls.from_pretrained.__func__
+    def corrupt_buffers(model_class,*args,**kwargs):
+        loaded=original(model_class,*args,**kwargs)
+        model=loaded[0] if isinstance(loaded,tuple) else loaded
+        # Emulate uninitialized nonpersistent storage left by meta loading.
+        model.rotary_emb.inv_freq.fill_(float('nan'))
+        model.rotary_emb.original_inv_freq.zero_()
+        return loaded
+    monkeypatch.setattr(cls,'from_pretrained',classmethod(corrupt_buffers))
+    loaded,info=load_draft(tmp_path/'base',attn_implementation='sdpa',output_loading_info=True)
+    torch.testing.assert_close(loaded.rotary_emb.inv_freq,base.rotary_emb.inv_freq,rtol=0,atol=0)
+    torch.testing.assert_close(loaded.rotary_emb.original_inv_freq,base.rotary_emb.original_inv_freq,rtol=0,atol=0)
+    assert frozen_digest(loaded.state_dict())==frozen_digest(base.state_dict())
 
 
 def test_reader_only_actual_training_exports_integrity(monkeypatch,tmp_path):

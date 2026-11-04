@@ -1,6 +1,22 @@
 """Sparse BF16 outliers are bounded; systematic state/content corruption fails."""
 import torch
-from gdn_preflight_metrics import state_pair_metrics, read_pair_metrics
+from gdn_preflight_metrics import state_pair_metrics, read_pair_metrics, entry_gate
+
+
+def test_same_prefix_gate_does_not_confuse_execution_length_drift():
+    # Mirrors the reported real-model case: 2.15% cross-length content drift,
+    # 0.49% same-prefix readout error. Keep both results, gate only reconstruction.
+    entry=dict(layers=[dict(passed=False,finite=True,relative_l2=.0211)],
+        reader_content=dict(passed=False,finite=True,relative_l2=.0215),
+        same_prefix_layers=[dict(passed=True,finite=True,relative_l2=.00274)],
+        same_prefix_reader_content=dict(passed=True,finite=True,relative_l2=.00491))
+    assert entry_gate(entry)
+    assert entry['cross_length_within_same_prefix_budget'] is False
+    entry['same_prefix_reader_content']['passed']=False
+    assert not entry_gate(entry)
+    entry['same_prefix_reader_content']['passed']=True
+    entry['layers'][0]['finite']=False
+    assert not entry_gate(entry)
 from litespec.vlm.gdn_reader import GDNStateReader
 
 

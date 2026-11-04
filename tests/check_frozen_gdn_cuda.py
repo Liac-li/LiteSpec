@@ -13,7 +13,8 @@ from litespec.vlm.gdn_reader import cache_reader_states
 from litespec.vlm.reader_adapt import initialize_reader_adaptation, frozen_digest
 from litespec.vlm.runtime import load_target, prepare_example, read_records, configure_image_token_budget
 from diagnose_gdn import reader_mode
-from gdn_preflight_metrics import state_pair_metrics, read_pair_metrics, STATE_LIMITS, READ_LIMIT
+from gdn_preflight_metrics import (state_pair_metrics, read_pair_metrics, STATE_LIMITS, READ_LIMIT,
+                                  GDNInputCapture, input_pair_metrics, entry_gate)
 
 
 def main():
@@ -35,11 +36,13 @@ def main():
     anchors=torch.tensor([[example.prefill_length,min(example.prefill_length+2,length-1)]],device='cuda')
     anchors=anchors.unique(sorted=True).view(1,-1);keep=torch.ones_like(anchors,dtype=torch.bool)
     with torch.no_grad(),RequestPositionState(target).activate():
-        with GDNAnchorCapture(target,reader.layer_ids,anchors,keep) as capture:
+        with GDNInputCapture(target,reader.layer_ids) as full_input_capture, GDNAnchorCapture(target,reader.layer_ids,anchors,keep) as capture:
             target(**example.inputs,use_cache=False,logits_to_keep=1)
             states=capture.states
+            full_layer_inputs=full_input_capture.values
     comparisons=[]
     report=dict(passed=False,state_parity=comparisons,state_limits=STATE_LIMITS,reader_relative_l2_limit=READ_LIMIT)
+    report['gate_scope']='same_prefix_only; cross_length_errors_retained_not_equivalence_claim'
     def persist():
         args.output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
     persist()
@@ -47,7 +50,9 @@ def main():
         inputs={k:(v[:,:a] if k in {'input_ids','attention_mask','mm_token_type_ids'} else v)
                 for k,v in example.inputs.items()}
         with torch.no_grad(),RequestPositionState(target).activate():
-            output=target(**inputs,use_cache=True,output_hidden_states=True,logits_to_keep=1)
+            with GDNInputCapture(target,reader.layer_ids) as native_input_capture:
+                output=target(**inputs,use_cache=True,output_hidden_states=True,logits_to_keep=1)
+                native_layer_inputs=native_input_capture.values
         native=cache_reader_states(draft,output.past_key_values)
         entry=dict(anchor=a,layers=[])
         comparisons.append(entry)
@@ -57,9 +62,14 @@ def main():
         # BF16 backbone differences from recurrence reconstruction differences.
         prefix_anchors=anchors.new_tensor([[a]])
         with torch.no_grad(),RequestPositionState(target).activate():
-            with GDNAnchorCapture(target,reader.layer_ids,prefix_anchors,torch.ones_like(prefix_anchors,dtype=torch.bool)) as capture:
+            with GDNInputCapture(target,reader.layer_ids) as prefix_input_capture, GDNAnchorCapture(target,reader.layer_ids,prefix_anchors,torch.ones_like(prefix_anchors,dtype=torch.bool)) as capture:
                 target(**inputs,use_cache=False,logits_to_keep=1)
                 prefix_states=capture.states
+                prefix_layer_inputs=prefix_input_capture.values
+        entry['layer_input_drift']=[dict(layer=layer,
+            cross_length=input_pair_metrics(full_layer_inputs[layer][:,:a],native_layer_inputs[layer]),
+            same_prefix=input_pair_metrics(prefix_layer_inputs[layer],native_layer_inputs[layer]))
+            for layer in reader.layer_ids]
         entry['same_prefix_layers']=[dict(layer=layer,**state_pair_metrics(actual[:,0],reference[:,0]))
             for layer,actual,reference in zip(reader.layer_ids,prefix_states,native)]
         # Probe the real Reader input with frozen-backbone representations, not
@@ -81,8 +91,7 @@ def main():
             tuple(s[:,slot] for s in states),tuple(s[:,0] for s in native))
         entry['same_prefix_reader_content']=read_pair_metrics(reader,hidden_at_reader[0],
             tuple(s[:,0] for s in prefix_states),tuple(s[:,0] for s in native))
-        passed=all(m['passed'] for m in entry['layers']+entry['same_prefix_layers']) and entry['reader_content']['passed'] and entry['same_prefix_reader_content']['passed']
-        entry['passed']=passed
+        passed=entry_gate(entry)
         persist()
         print(json.dumps(dict(state_comparison=entry),allow_nan=False),flush=True)
         if not passed:

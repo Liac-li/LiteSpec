@@ -3,6 +3,49 @@ import torch
 import torch.nn.functional as F
 
 
+class GDNInputCapture:
+    """Observe layer inputs without changing projections, caches or precision."""
+    def __init__(self,target,layer_ids):
+        self.target,self.layer_ids=target,set(layer_ids)
+        self.values,self.handles={},[]
+
+    def __enter__(self):
+        for module in self.target.modules():
+            index=getattr(module,'layer_idx',None)
+            if index in self.layer_ids and hasattr(module,'in_proj_qkv'):
+                def capture(layer,args,kwargs,key=index):
+                    hidden=args[0] if args else kwargs['hidden_states']
+                    self.values[key]=hidden.detach()
+                self.handles.append(module.register_forward_pre_hook(capture,with_kwargs=True))
+        if len(self.handles)!=len(self.layer_ids):
+            self.__exit__(None,None,None)
+            raise ValueError('cannot locate every selected native GDN input')
+        return self
+
+    def __exit__(self,*exc):
+        for handle in self.handles:handle.remove()
+        self.handles.clear()
+
+
+def input_pair_metrics(actual,reference):
+    if actual.shape!=reference.shape:raise ValueError('GDN input shapes differ')
+    a,r=actual.float(),reference.float()
+    if not bool(torch.isfinite(a).all() and torch.isfinite(r).all()):
+        return dict(finite=False)
+    return dict(finite=True,relative_l2=float((a-r).norm()/r.norm().clamp_min(1e-12)),
+                max_abs_error=float((a-r).abs().max()))
+
+
+def entry_gate(entry):
+    """Reconstruction correctness uses identical inputs; cross-length drift stays visible."""
+    same_prefix=all(m['passed'] for m in entry['same_prefix_layers']) and entry['same_prefix_reader_content']['passed']
+    finite_cross=all(m.get('finite',False) for m in entry['layers']) and entry['reader_content'].get('finite',False)
+    entry['cross_length_within_same_prefix_budget']=all(m['passed'] for m in entry['layers']) and entry['reader_content']['passed']
+    entry['passed']=bool(same_prefix and finite_cross)
+    entry['gate_scope']='same_prefix_reconstruction_and_content; cross_length_drift_diagnostic_only_except_nonfinite'
+    return entry['passed']
+
+
 STATE_LIMITS = dict(relative_l2=.005, worst_head_relative_l2=.02,
                     old_tolerance_outlier_fraction=.0001, max_old_tolerance_units=4.)
 READ_LIMIT = .01

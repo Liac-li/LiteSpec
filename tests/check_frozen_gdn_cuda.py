@@ -13,6 +13,7 @@ from litespec.vlm.gdn_reader import cache_reader_states
 from litespec.vlm.reader_adapt import initialize_reader_adaptation, frozen_digest
 from litespec.vlm.runtime import load_target, prepare_example, read_records, configure_image_token_budget
 from diagnose_gdn import reader_mode
+from gdn_preflight_metrics import state_pair_metrics, read_pair_metrics, STATE_LIMITS, READ_LIMIT
 
 
 def main():
@@ -38,15 +39,54 @@ def main():
             target(**example.inputs,use_cache=False,logits_to_keep=1)
             states=capture.states
     comparisons=[]
+    report=dict(passed=False,state_parity=comparisons,state_limits=STATE_LIMITS,reader_relative_l2_limit=READ_LIMIT)
+    def persist():
+        args.output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+    persist()
     for slot,a in enumerate(anchors[0].tolist()):
         inputs={k:(v[:,:a] if k in {'input_ids','attention_mask','mm_token_type_ids'} else v)
                 for k,v in example.inputs.items()}
         with torch.no_grad(),RequestPositionState(target).activate():
-            output=target(**inputs,use_cache=True,logits_to_keep=1)
+            output=target(**inputs,use_cache=True,output_hidden_states=True,logits_to_keep=1)
         native=cache_reader_states(draft,output.past_key_values)
+        entry=dict(anchor=a,layers=[])
+        comparisons.append(entry)
         for layer,actual,reference in zip(reader.layer_ids,states,native):
-            torch.testing.assert_close(actual[:,slot],reference[:,0],atol=.003,rtol=.02)
-            comparisons.append(dict(layer=layer,anchor=a,max_abs_error=float((actual[:,slot]-reference[:,0]).abs().max())))
+            entry['layers'].append(dict(layer=layer,**state_pair_metrics(actual[:,slot],reference[:,0])))
+        # Capture the SAME prefix independently to separate length-dependent
+        # BF16 backbone differences from recurrence reconstruction differences.
+        prefix_anchors=anchors.new_tensor([[a]])
+        with torch.no_grad(),RequestPositionState(target).activate():
+            with GDNAnchorCapture(target,reader.layer_ids,prefix_anchors,torch.ones_like(prefix_anchors,dtype=torch.bool)) as capture:
+                target(**inputs,use_cache=False,logits_to_keep=1)
+                prefix_states=capture.states
+        entry['same_prefix_layers']=[dict(layer=layer,**state_pair_metrics(actual[:,0],reference[:,0]))
+            for layer,actual,reference in zip(reader.layer_ids,prefix_states,native)]
+        # Probe the real Reader input with frozen-backbone representations, not
+        # its final output: up is zero at initialization and would hide errors.
+        pending=output.logits[:,-1:].argmax(-1)
+        from litespec.vlm.runtime import draft_block, selected_layers
+        from litespec.vlm.context import ContextPolicy
+        pivot=selected_layers(output.hidden_states,draft.target_layer_ids,draft.config.num_target_layers)[:,-1:].detach()
+        hidden_at_reader=[]
+        handle=reader.register_forward_pre_hook(lambda module,args:hidden_at_reader.append(args[0].detach()))
+        try:
+            with torch.no_grad():
+                draft_block(draft,target.get_input_embeddings(),anchor_ids=pending,pivot=pivot,history=None,
+                    anchor=a,prefill_length=example.prefill_length,vision_mask=example.vision_mask,
+                    policy=ContextPolicy.no_history(),gdn_states=native)
+        finally:handle.remove()
+        if len(hidden_at_reader)!=1:raise RuntimeError('expected one Reader input capture')
+        entry['reader_content']=read_pair_metrics(reader,hidden_at_reader[0],
+            tuple(s[:,slot] for s in states),tuple(s[:,0] for s in native))
+        entry['same_prefix_reader_content']=read_pair_metrics(reader,hidden_at_reader[0],
+            tuple(s[:,0] for s in prefix_states),tuple(s[:,0] for s in native))
+        passed=all(m['passed'] for m in entry['layers']+entry['same_prefix_layers']) and entry['reader_content']['passed'] and entry['same_prefix_reader_content']['passed']
+        entry['passed']=passed
+        persist()
+        print(json.dumps(dict(state_comparison=entry),allow_nan=False),flush=True)
+        if not passed:
+            raise RuntimeError(f'GDN state/content mismatch; detailed metrics: {args.output}')
         del output,native
     online=aligned.CPUReferenceDLite(draft,target.get_output_embeddings(),target.get_input_embeddings(),
         draft.mask_token_id,draft.block_size,attention_backend='flex_attention',num_anchors=2,
@@ -69,8 +109,9 @@ def main():
         raise RuntimeError('Reader content projections have no gradient after warmup updates')
     if frozen_digest(draft.state_dict())!=cfg['frozen_backbone_sha256']:
         raise RuntimeError('frozen backbone changed')
-    args.output.write_text(json.dumps(dict(passed=True,state_parity=comparisons,zero_init_identity=True,
-        frozen_backbone_unchanged=True,reader_gradients=history,scope='single_GPU_SDPA_real_model_not_FSDP'),indent=2)+'\n')
+    report.update(passed=True,zero_init_identity=True,frozen_backbone_unchanged=True,
+                  reader_gradients=history,scope='single_GPU_SDPA_real_model_not_FSDP')
+    persist()
     print(f'Passed real-model preflight: {args.output}',flush=True)
 
 

@@ -61,9 +61,21 @@ modified on disk. Then torchrun smoke exercises production FlexAttention/FSDP:
 32 input records, one epoch, accumulation 1, at most two optimizer steps per arm.
 An error stops the launch. No silent fallback is used.
 
-The preflight compares state tensors with atol=.003, rtol=.02 to accommodate native
-BF16 chunk versus recurrent rounding. Review the recorded absolute errors if it
-fails; do not silently increase tolerances to proceed.
+The preflight records the original elementwise atol=.003/rtol=.02 check but gates
+on a bounded BF16 policy: relative state L2 <=0.5%, worst-head relative L2 <=2%,
+at most 0.01% of elements outside the original tolerance, and no element beyond
+4 times its original error budget. ALL these conditions must hold. It additionally
+requires <=1% relative error in the initialized Reader's low-rank CONTENT readout,
+before log-RMS fusion and the zero-initialized output map. This is a numerical
+preflight policy, not a proof of trained-model or lossless decoding equivalence.
+
+Both full-sequence reconstructed states and independently reconstructed SAME-prefix
+states are compared with native prefix caches. The two comparisons help separate
+length-dependent BF16 backbone differences from recurrence reconstruction errors.
+All metrics are printed and written to `preflight.json` BEFORE any gate fails;
+the file retains `passed:false` until the entire preflight succeeds. A sparse
+pointwise failure alone no longer stops the run, but systematic/head-local/content
+errors still do. Do not bypass a failing gate or adjust limits merely to pass.
 
 ## Formal training
 

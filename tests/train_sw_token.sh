@@ -23,7 +23,7 @@ export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 read -r -a windows <<< "${WINDOW_SIZES:-1 2 5 10}"
 [[ -s "$TRAIN_DATA" ]] || { echo "Missing training data: $TRAIN_DATA" >&2; exit 1; }
 # Validate everything and pin last to one fixed parent BEFORE any training.
-export INIT_CHECKPOINT="$($PYTHON_BIN - <<'PY'
+INIT_CHECKPOINT="$($PYTHON_BIN - <<'PY'
 import os
 from pathlib import Path
 from litespec.vlm.sw_token import warm_start_config
@@ -32,6 +32,7 @@ cfg={}; warm_start_config(cfg,p)
 print(p)
 PY
 )"
+export INIT_CHECKPOINT
 [[ ! -e "$RUN_GROUP" ]] || { echo "Choose a fresh RUN_GROUP: $RUN_GROUP" >&2; exit 1; }
 "$PYTHON_BIN" - "${windows[@]}" <<'PY'
 import sys

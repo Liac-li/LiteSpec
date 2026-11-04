@@ -532,6 +532,12 @@ class Qwen3DLiteAttention(nn.Module):
         v = v.transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        # Opt-in, untimed diagnostics observe the actual normalized/rotated Q/K.
+        # The normal attention backend and returned activations stay unchanged.
+        observer = getattr(self, "_sw_attention_observer", None)
+        if observer is not None:
+            observer(self, q, k, attention_mask, ctx_len)
+
         if self.config._attn_implementation == "flex_attention":
             # Call FlexAttention directly.  Transformers requests LSE during
             # training, but the FLASH backend cannot backpropagate through the

@@ -19,6 +19,11 @@ PATHS = (
     "tests/test_sw_token.py",
     "tests/test_sw_token_entrypoints.py",
     "tests/test_sw_token_source.py",
+    "tests/sw_token_probe.py",
+    "tests/diagnose_sw_token.py",
+    "tests/diagnose_sw_token.sh",
+    "tests/train_sw_token_pair.sh",
+    "tests/test_sw_token_probe.py",
 )
 
 def check_file(path):

@@ -118,7 +118,7 @@ def selected_layers(states, ids, depth):
 
 
 def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
-                prefill_length, vision_mask, policy, pivot_keep=None):
+                prefill_length, vision_mask, policy, pivot_keep=None, rotary_shift=0):
     """One block, identical context selection during training and decoding."""
     student = draft.is_student
     if student and not policy.is_empty:
@@ -173,6 +173,11 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
                                             device=device, dtype=torch.bool)])
         attention_mask = torch.zeros((1, 1, block_size, allow.numel()), device=device, dtype=dtype)
         attention_mask.masked_fill_(~allow.view(1, 1, 1, -1), torch.finfo(dtype).min)
+    if rotary_shift:
+        if not student:
+            raise ValueError("diagnostic rotary_shift requires a student")
+        context_pos = context_pos + rotary_shift
+        q_pos = q_pos + rotary_shift
     output = draft(
         noise_embedding=query, target_hidden=pivot, position_ids=q_pos,
         rotary_position_ids=torch.cat([context_pos, q_pos], dim=-1),

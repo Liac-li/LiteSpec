@@ -6,6 +6,7 @@ export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO")}"
 export CUDA_VISIBLE_DEVICES="${EVAL_GPU:-7}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 PYTHON_BIN="${PYTHON_BIN:-$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python}"
+"$PYTHON_BIN" tests/check_sw_token_source.py
 RESULT_DIR="${RESULT_DIR:-$DLITE_WORKSPACE/runs/video_sw_scan_$(date +%Y%m%d_%H%M%S)_$$}"
 read -r -a windows <<< "${WINDOW_SIZES:-1 2 5 10}"
 read -r -a tests <<< "${TESTS:-Video-MME VideoDetailCaption textvqa text-only}"

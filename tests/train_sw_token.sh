@@ -19,6 +19,7 @@ export REPORT_TO="${REPORT_TO:-tensorboard}"
 export SAVE_TRAINING_STATE=0
 export ALGORITHM=dlite
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+"$PYTHON_BIN" tests/check_sw_token_source.py
 read -r -a windows <<< "${WINDOW_SIZES:-1 2 5 10}"
 [[ -s "$TRAIN_DATA" ]] || { echo "Missing training data: $TRAIN_DATA" >&2; exit 1; }
 # Validate everything and pin last to one fixed parent BEFORE any training.

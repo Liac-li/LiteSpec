@@ -106,3 +106,19 @@ real tiny hybrid Qwen3.5 image decoding with per-token state handling, weights-o
 training/export, frozen selection and CLI routing. Full checkpoints, actual video
 GPU kernels, distributed training memory and throughput still require the server
 runs above; no measured acceptance/speed improvement is asserted by this change.
+
+## Source integrity before GPU startup
+
+Both shell entrypoints run `tests/check_sw_token_source.py` first. It checks the
+experiment's Python syntax and rejects tool-output truncation markers. The
+stdlib-only regression suite can also run without Torch:
+
+```bash
+"$PYTHON_BIN" -m unittest discover -s tests -p test_sw_token_source.py -v
+```
+
+The initial publication `8c01480` contained a truncated/concatenated
+`static_batch.py` despite the local tests having passed. Its repair restores the
+file from the video branch and reapplies the window-only edits. The integrity
+guard is a publication regression check; it does not validate GPU kernels or
+measure performance.

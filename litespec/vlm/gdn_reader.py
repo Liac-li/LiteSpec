@@ -26,6 +26,7 @@ def reader_config(target_config, cfg):
     return dict(layer_ids=list(layers), heads=text.linear_num_value_heads,
                 key_dim=text.linear_key_head_dim, value_dim=text.linear_value_head_dim,
                 rank=int(cfg.get("gdn_rank", 8)), bottleneck=int(cfg.get("gdn_bottleneck", 128)),
+                feature_mode=cfg.get("gdn_feature_mode", "full"),
                 chunk_anchors=int(cfg.get("gdn_chunk_anchors", 16)),
                 injection_layer=int(cfg.get("gdn_injection_layer", cfg["num_draft_layers"] - 1)))
 
@@ -36,6 +37,10 @@ class GDNStateReader(nn.Module):
         self.layer_ids = tuple(config["layer_ids"])
         self.heads, self.dk, self.dv = (config[k] for k in ("heads", "key_dim", "value_dim"))
         self.rank, self.chunk_anchors = config["rank"], config["chunk_anchors"]
+        self.feature_mode = config.get("feature_mode", "full")
+        self.probe_mode = "normal"
+        if self.feature_mode not in {"full", "content_only"}:
+            raise ValueError("unknown GDN feature mode")
         layers, heads, rank = len(self.layer_ids), self.heads, self.rank
         if min(layers, heads, self.dk, self.dv, rank, config["bottleneck"], self.chunk_anchors) < 1:
             raise ValueError("GDN reader dimensions must be positive")
@@ -51,6 +56,8 @@ class GDNStateReader(nn.Module):
         b, a, n, d = hidden.shape
         query = self.query(F.rms_norm(hidden.float(), (d,)).to(hidden.dtype))
         query = query.reshape(b, a, n, len(states), self.heads, self.rank)
+        if self.probe_mode == "shared_query":
+            query = query[:, :, :1].expand_as(query)
         keys = torch.einsum("banlhr,lhrk->banlhk", query, self.query_up)
         reads, scales = [], []
         for i, state in enumerate(states):
@@ -61,7 +68,15 @@ class GDNStateReader(nn.Module):
             compressed = torch.einsum("hvr,bahvk->bahrk", self.value_down[i], normalized)
             reads.append(torch.einsum("bahrk,banhk->banhr", compressed, keys[:, :, :, i]) / math.sqrt(self.dk))
             scales.append(rms[..., 0, 0].log().to(hidden.dtype)[:, :, None, :, None].expand(b, a, n, self.heads, 1))
-        features = torch.cat((torch.stack(reads, 3), torch.stack(scales, 3)), -1).flatten(3)
+        content, scale = torch.stack(reads, 3), torch.stack(scales, 3)
+        if getattr(self, "record_probe_stats", False):
+            self.probe_stats = dict(content_rms=float(content.detach().float().square().mean().sqrt()),
+                                    scale_rms=float(scale.detach().float().square().mean().sqrt()))
+        if self.probe_mode == "scale_only":
+            content = torch.zeros_like(content)
+        if self.feature_mode == "content_only" or self.probe_mode == "content_only":
+            scale = torch.zeros_like(scale)
+        features = torch.cat((content, scale), -1).flatten(3)
         features = F.rms_norm(features.float(), (features.shape[-1],)).to(hidden.dtype)
         return hidden + self.up(F.silu(self.down(features)))
 

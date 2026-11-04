@@ -249,7 +249,13 @@ class VLMAdapter:
     modes = ()
 
     def enter_phase(self, session, phase):
-        session.draft.train()
+        if getattr(session, 'vlm_config', {}).get('reader_only'):
+            session.draft.eval()
+            for name, module in session.draft.named_modules():
+                if name.endswith('.gdn_reader'):
+                    module.train()
+        else:
+            session.draft.train()
 
     def compute_step(self, session, example, *, microbatch_start=None, microbatch_end=None,
                      collect_detailed_metrics=True):
@@ -305,6 +311,18 @@ def save(session, name):
     if dist.is_initialized():
         dist.barrier()
     if rank() == 0:
+        if session.vlm_config.get("reader_only"):
+            from .reader_adapt import frozen_digest
+            if frozen_digest(weights) != session.vlm_config["frozen_backbone_sha256"]:
+                raise RuntimeError("frozen DLite changed; refusing checkpoint export")
+            reader_weights = {k: v.detach().float() for k,v in weights.items() if ".gdn_reader." in k}
+            if not reader_weights or any(not bool(torch.isfinite(v).all()) for v in reader_weights.values()):
+                raise RuntimeError("missing/nonfinite trained Reader weights")
+            (staging / "reader_update_audit.json").write_text(json.dumps(dict(
+                frozen_backbone_unchanged=True,
+                parameters={k:dict(norm=float(v.norm()),nonzero=int(v.count_nonzero()),
+                    changed_from_zero_initialization=bool(v.count_nonzero()) if k.endswith('.up.weight') else None)
+                            for k,v in reader_weights.items()}),indent=2))
         session.draft.save_pretrained(staging, state_dict=weights)
         (staging / "vlm_run.json").write_text(json.dumps(session.vlm_config, indent=2))
         (staging / "checkpoint.json").write_text(json.dumps(dict(world_size=world(), cursor=asdict(session.state),
@@ -347,6 +365,9 @@ def log(session, window, grad_norm):
     scalars.update({f"learning_rate/{k}": float(v)
                     for k, v in session.optimizer.get_learning_rates().items()})
     scalars["memory/gdn_anchor_mib"] = getattr(session, "gdn_anchor_bytes", 0) / 2**20
+    # Last local backward call, before accumulation normalization/reduction.
+    for key, value in getattr(session, "reader_backward_probes", {}).items():
+        scalars[f"reader_last_local_backward_norm/{key}"] = float(value)
     if session.device != "cpu":
         scalars["memory/peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2**30
     scalars.update(grad_norm=float(grad_norm),
@@ -361,6 +382,10 @@ def log(session, window, grad_norm):
                               **progress,
                               grad_norm=grad_norm, learning_rates=session.optimizer.get_learning_rates(),
                               metrics={k: float(v) for k, v in metrics.items()})), flush=True)
+        if session.vlm_config.get("reader_only"):
+            print(json.dumps(dict(reader_backward_probe_step=session.state.optimizer_step,
+                                  scope="last_local_backward_unnormalized_not_global_gradient",
+                                  norms={k: float(v) for k,v in session.reader_backward_probes.items()})), flush=True)
     # Preserve upstream cross-epoch accumulation: export at the first update
     # boundary after an epoch, never discard or serialize partial gradients.
     if completed > session.last_exported_epoch:
@@ -383,6 +408,8 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    if cfg.get("reader_only") and (cfg.get("use_muon") or args.save_training_state):
+        raise ValueError("Reader-only adaptation requires use_muon=false and inference-only checkpoint exports")
     if args.report_to is not None:
         cfg["report_to"] = args.report_to
     for key in ("target_model", "train_data", "output_dir"):
@@ -414,6 +441,13 @@ def run(argv=None):
     torch.manual_seed(cfg["seed"])
     target, processor = load_target(cfg["target_model"], device=device,
                                     dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+    adapted_draft = None
+    if cfg.get("reader_only"):
+        if args.resume:
+            raise ValueError("reader-only adaptation currently exports inference checkpoints; start a fresh run")
+        from .reader_adapt import initialize_reader_adaptation
+        # Resolve checkpoint block size BEFORE dataset eligibility and anchor sampling.
+        adapted_draft = initialize_reader_adaptation(target, cfg, attention="sdpa" if device == "cpu" else "flex_attention")
     from .runtime import configure_image_token_budget
     configure_image_token_budget(processor, target.config, cfg.get("image_max_tokens"))
     path = Path(cfg["train_data"])
@@ -451,7 +485,9 @@ def run(argv=None):
         if saved["schema"] != "vlm_upstream_sft_v1" or saved["config"] != cfg:
             raise ValueError("resume configuration/data/world-size differs")
     torch.manual_seed(cfg["seed"])
-    if cfg.get("algorithm", "dlite") == "dlite":
+    if cfg.get("reader_only"):
+        draft = adapted_draft
+    elif cfg.get("algorithm", "dlite") == "dlite":
         draft = make_draft(target, processor, cfg)
     else:
         from .baselines import make_draft as make_baseline
@@ -494,6 +530,13 @@ def run(argv=None):
     session.sampler, session.device, session.base_dir = sampler, device, path.parent
     session.last_exported_epoch = 0
     session.save_training_state = args.save_training_state
+    session.reader_backward_probes = {}
+    if cfg.get("reader_only"):
+        for name, parameter in draft.named_parameters():
+            if parameter.requires_grad:
+                def record_gradient(gradient, key=name):
+                    session.reader_backward_probes[key] = gradient.detach().float().norm()
+                parameter.register_hook(record_gradient)
     session.tracker = SimpleNamespace(log=lambda *a, **kw: None, close=lambda: None)
     if cfg["report_to"] != "none":
         from litespec.training.logging import TrackerArgs, create_tracker, get_tracker_class

@@ -97,14 +97,45 @@ def checkpoint_audit(path,draft):
 
 @contextmanager
 def reader_mode(reader,mode):
-    if mode not in {'normal','off','wrong'}:raise ValueError(mode)
+    if mode not in {'normal','off','wrong','wrong_content','content_only','scale_only','shared_query'}:raise ValueError(mode)
     had_local='forward' in reader.__dict__;local=reader.__dict__.get('forward')
+    previous_probe = reader.probe_mode
+    previous_record = getattr(reader, 'record_probe_stats', False)
+    reader.probe_mode = mode
+    reader.record_probe_stats = True
     if mode=='off':reader.forward=MethodType(lambda self,hidden,states:hidden,reader)
     try:yield
     finally:
+        reader.probe_mode = previous_probe
+        reader.record_probe_stats = previous_record
         if mode=='off':
             if had_local:reader.forward=local
             else:del reader.forward
+
+
+def replace_content_keep_scale(normal, wrong):
+    """Match each donor matrix's raw RMS to its recipient, preserving donor direction."""
+    result=[]
+    for own, donor in zip(normal, wrong):
+        own_rms=own.float().square().mean((-2,-1),keepdim=True).sqrt()
+        donor_rms=donor.float().square().mean((-2,-1),keepdim=True).sqrt()
+        if bool((donor_rms == 0).any()):
+            raise ValueError('cannot RMS-match a zero donor state')
+        result.append(donor.float() * (own_rms/donor_rms))
+    return tuple(result)
+
+
+def paired_effects(row, off):
+    first_reject=int(off['fixed_reference_committed_length'])-1
+    observed=first_reject<len(off.get('candidate_token_ids',[]))
+    truth=row.get('reference_candidate_token_ids',[])
+    proposals=row.get('candidate_token_ids',[])
+    row.update(first_candidate_repaired=int(not off['first_candidate_correct'] and row['first_candidate_correct']),
+               first_candidate_broken=int(off['first_candidate_correct'] and not row['first_candidate_correct']),
+               baseline_first_rejection_observed=int(observed),
+               baseline_first_rejection_repaired=int(observed and proposals[:first_reject+1]==truth[:first_reject+1]),
+               accepted_prefix_broken=int(row['fixed_reference_committed_length']<off['fixed_reference_committed_length']),
+               committed_length_delta_vs_off=row['fixed_reference_committed_length']-off['fixed_reference_committed_length'])
 
 
 def extended_inputs(example,continuation,offset):
@@ -166,11 +197,15 @@ def run_mode(target,draft,example,output,states,reference,offset,mode,teacher_lo
     p=logits.softmax(-1);teacher=teacher_logits.float().softmax(-1)
     truth=candidates.new_tensor(reference[offset+1:offset+1+candidates.shape[1]])[None]
     row=dict(mode=mode,positions=logits.shape[1],residual=residuals[0],
+        reader_feature_mode=reader.feature_mode,
+        reader_features=getattr(reader,'probe_stats',{}) if mode!='off' else {},
         ce_target_greedy=float(F.cross_entropy(logits.flatten(0,1),teacher_logits.argmax(-1).flatten())),
         ce_reference_tokens=float(F.cross_entropy(logits.flatten(0,1),truth.flatten())),
         l1_to_target=float((p-teacher).abs().sum(-1).mean()),
         fixed_reference_committed_length=1+int((candidates==truth).cumprod(1).sum()),
-        candidate_token_ids=candidates[0].tolist(),teacher_forced_top1=logits.argmax(-1)[0].tolist())
+        first_candidate_correct=bool((candidates[:,0]==truth[:,0]).item()),
+        candidate_token_ids=candidates[0].tolist(),reference_candidate_token_ids=truth[0].tolist(),
+        teacher_forced_top1=logits.argmax(-1)[0].tolist())
     return row,logits,candidates
 
 
@@ -221,6 +256,13 @@ def summarize(rows):
         for field in fields:
             summary[field]=(sum(r[field]*r['positions'] for r in group)/summary['positions'] if field in weighted
                             else statistics.mean(r[field] for r in group))
+        if 'first_candidate_repaired' in group[0]:
+            summary.update(first_candidate_repairs=sum(r['first_candidate_repaired'] for r in group),
+                           first_candidate_breaks=sum(r['first_candidate_broken'] for r in group),
+                           baseline_first_rejection_opportunities=sum(r['baseline_first_rejection_observed'] for r in group),
+                           baseline_first_rejection_repairs=sum(r['baseline_first_rejection_repaired'] for r in group),
+                           accepted_prefix_breaks=sum(r['accepted_prefix_broken'] for r in group),
+                           mean_committed_length_delta_vs_off=statistics.mean(r['committed_length_delta_vs_off'] for r in group))
         summaries.append(summary)
     return summaries
 
@@ -228,6 +270,11 @@ def summarize(rows):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-group',type=Path,required=True)
+    parser.add_argument('--checkpoint',nargs=2,action='append',metavar=('LABEL','PATH'),
+                        help='explicit Reader checkpoint(s); replaces the legacy two-arm discovery')
+    parser.add_argument('--inputs-dir',type=Path,help='directory of fixed diagnostic input JSONL manifests')
+    parser.add_argument('--modes',nargs='+',default=['normal','off','wrong'],
+                        choices=['normal','off','wrong','wrong_content','content_only','scale_only','shared_query'])
     parser.add_argument('--output-dir',type=Path,required=True)
     parser.add_argument('--samples-per-dataset',type=int,default=8)
     parser.add_argument('--reference-tokens',type=int,default=64)
@@ -238,17 +285,22 @@ def main(argv=None):
     args=parser.parse_args(argv)
     if args.samples_per_dataset<2 or args.reference_tokens<2 or not args.offsets or min(args.offsets)<0:
         parser.error('need >=2 different samples, >=2 reference tokens and nonnegative offsets')
+    if not {'normal','off'}.issubset(args.modes) or len(set(args.modes)) != len(args.modes):
+        parser.error('modes must include normal and off, without duplicates')
     run=args.run_group.expanduser().resolve();root=args.output_dir.expanduser().resolve()
     root.mkdir(parents=True,exist_ok=False)
     torch.manual_seed(args.seed)
-    cfg=json.loads((run/'dlite_gdn/last/vlm_run.json').read_text())
+    selected = args.checkpoint or [(label,str(run/label/'last')) for label in ('dflash_gdn','dlite_gdn')]
+    if len({label for label,_ in selected}) != len(selected):
+        parser.error('checkpoint labels must be unique')
+    cfg=json.loads((Path(selected[0][1]).expanduser()/'vlm_run.json').read_text())
     target_path=cfg['target_model'];image_cap=cfg.get('image_max_tokens',1024)
     target,processor=load_target(target_path,device=args.device,
         dtype=torch.float32 if args.device=='cpu' else torch.bfloat16,attention=args.attention)
     configure_image_token_budget(processor,target.config,image_cap)
     drafts={};audits={};checkpoints={}
-    for label in ('dflash_gdn','dlite_gdn'):
-        path=run/label/'last'
+    for label, checkpoint_path in selected:
+        path=Path(checkpoint_path).expanduser().resolve()
         draft=load_draft(path,attn_implementation='sdpa',dtype=target.dtype).to(args.device).eval()
         audits[label]=checkpoint_audit(path,draft)
         write_json(root/'checkpoint_audit.json',audits)
@@ -258,13 +310,14 @@ def main(argv=None):
             raise ValueError('target/image budget differs between checkpoints')
         drafts[label]=draft
         checkpoints[label]=str(path.resolve())
-    files=sorted((run/'evaluation/inputs').glob('*.jsonl'))
+    files=sorted((args.inputs_dir or run/'evaluation/inputs').glob('*.jsonl'))
     if not files:raise ValueError('missing saved evaluation inputs under run-group/evaluation/inputs')
     settings=dict(run_group=str(run),checkpoints=checkpoints,target_model=target_path,image_max_tokens=image_cap,
         samples_per_dataset=args.samples_per_dataset,reference_tokens=args.reference_tokens,offsets=args.offsets,
         seed=args.seed,attention=args.attention,device=args.device,
         historical_gradients='reader-specific gradients not recorded; this program only probes current gradients',
         scope='fixed native-AR reference anchors; not speed benchmark or lossless verifier test',
+        modes=args.modes,
         code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     write_json(root/'settings.json',settings)
     rows=[];probes={};skipped=[]
@@ -308,8 +361,11 @@ def main(argv=None):
                             del verified
                         for label,draft in drafts.items():
                             normal_logits=normal_candidates=None
-                            for mode in ('normal','off','wrong'):
+                            mode_rows=[]
+                            for mode in ['normal']+[m for m in args.modes if m!='normal']:
                                 states=wrong[label] if mode=='wrong' else normal[label]
+                                if mode=='wrong_content':
+                                    states=replace_content_keep_scale(normal[label],wrong[label])
                                 row,logits,candidates=run_mode(target,draft,example,output,states,reference,offset,mode,teacher[:,:min(draft.block_size-1,teacher.shape[1])])
                                 if mode=='normal':normal_logits,normal_candidates=logits,candidates
                                 row.update(compare(normal_logits,logits,normal_candidates,candidates))
@@ -318,6 +374,10 @@ def main(argv=None):
                                     donor_offset=donor_offset,donor_prompt_tokens=examples[other].prefill_length,
                                     recipient_prompt_tokens=example.prefill_length,
                                     state_rms=[float(s.float().square().mean().sqrt()) for s in states])
+                                mode_rows.append(row)
+                            off=next(r for r in mode_rows if r['mode']=='off')
+                            for row in mode_rows:
+                                paired_effects(row,off)
                                 rows.append(row);detail.write(json.dumps(row,allow_nan=False)+'\n');detail.flush()
                             if label not in probes:
                                 probes[label]=gradient_probe(target,draft,example,output,normal[label],reference,offset,teacher[:,:min(draft.block_size-1,teacher.shape[1])])
@@ -334,10 +394,13 @@ def main(argv=None):
         'Wrong-state donors are different images/questions. Their prompt lengths may differ; see anchors.jsonl.',
         'CE/L1/flip rates are weighted by supervised positions; reference committed length is an equal-anchor mean.',
         'This is not a throughput benchmark or an AR equivalence test.','',
-        '| Model | Dataset | Mode | Anchors | CE | L1 | Reference length | Residual ratio | Candidate change |',
-        '|---|---|---|---:|---:|---:|---:|---:|---:|']
+        'Repairs/breaks are first-candidate changes relative to Reader-off at the SAME prefix.',
+        'Wrong-content retains each recipient head/layer RMS while replacing its matrix direction.',
+        '',
+        '| Model | Dataset | Mode | Anchors | CE | L1 | Reference length | Residual ratio | Candidate change | First repairs | First breaks | Rejection repairs / opportunities | Prefix breaks |',
+        '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for s in summaries:
-        lines.append(f"| {s['model']} | {s['dataset']} | {s['mode']} | {s['anchors']} | {s['ce_target_greedy']:.5f} | {s['l1_to_target']:.5f} | {s['fixed_reference_committed_length']:.3f} | {s['mean_residual_ratio']:.6g} | {s['free_running_candidate_change_fraction']:.2%} |")
+        lines.append(f"| {s['model']} | {s['dataset']} | {s['mode']} | {s['anchors']} | {s['ce_target_greedy']:.5f} | {s['l1_to_target']:.5f} | {s['fixed_reference_committed_length']:.3f} | {s['mean_residual_ratio']:.6g} | {s['free_running_candidate_change_fraction']:.2%} | {s['first_candidate_repairs']} | {s['first_candidate_breaks']} | {s['baseline_first_rejection_repairs']}/{s['baseline_first_rejection_opportunities']} | {s['accepted_prefix_breaks']} |")
     (root/'report.md').write_text('\n'.join(lines)+'\n')
     print(f'Diagnostics: {root}/report.md',flush=True)
 

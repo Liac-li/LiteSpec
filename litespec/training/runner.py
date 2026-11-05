@@ -293,7 +293,7 @@ def run_draft(session, *, batch_source=iter_logical_batches, save=None, log=log_
             accumulated += 1
             if accumulated == args.accumulation_steps:
                 update()
-            if state.global_step % args.save_interval == 0 and accumulated == 0:
+            if args.save_interval > 0 and state.global_step % args.save_interval == 0 and accumulated == 0:
                 suffix = (
                     f"step_{state.global_step}"
                     if session.topology is not None

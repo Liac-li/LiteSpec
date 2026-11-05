@@ -52,6 +52,10 @@ def make_draft(target, processor, cfg):
         target_layer_ids=layers, sequential_head="rnn", sequential_rank=cfg.get("sequential_rank", 64),
         mask_token_id=mask_id,
     )
+    if cfg.get("shared_stage_kv", False):
+        config.dlite_config.update(
+            shared_stage_kv=True, chs_stage_ids=list(cfg["chs_stage_ids"])
+        )
     if role == "swa_teacher":
         # The VLM reference path explicitly selects history positions; it does
         # not invoke the legacy SWA inference/training path.

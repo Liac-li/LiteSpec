@@ -58,6 +58,8 @@ def load_config(path):
         raise ValueError("VLM adapter requires the no-history student")
     if cfg["num_epochs"] < 1 or cfg["accumulation_steps"] < 1 or cfg["num_anchors"] < 1:
         raise ValueError("epochs, accumulation and anchors must be positive")
+    if cfg.get("save_epoch_interval", 1.0) <= 0 or cfg["save_interval"] < 0:
+        raise ValueError("save_epoch_interval must be positive; save_interval must be >= 0")
     cfg["upstream_config_sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
     cfg["context_policy"] = dict(prefill_text="drop", prefill_vision="drop", decode_mode="none",
                                  window_size=0, implementation="compact")
@@ -315,7 +317,9 @@ def save(session, name):
         session.draft.save_pretrained(staging, state_dict=weights)
         (staging / "vlm_run.json").write_text(json.dumps(session.vlm_config, indent=2))
         (staging / "checkpoint.json").write_text(json.dumps(dict(world_size=world(), cursor=asdict(session.state),
-                                                               resumable=session.save_training_state)))
+                                                               resumable=session.save_training_state,
+                                                               save_reason=name,
+                                                               epoch_progress=session.state.global_step / session.steps_per_epoch)))
         os.replace(staging, destination)
         link = root / (".last-" + uuid.uuid4().hex)
         link.symlink_to(destination.name, target_is_directory=True)
@@ -365,11 +369,13 @@ def log(session, window, grad_norm):
                               **progress,
                               grad_norm=grad_norm, learning_rates=session.optimizer.get_learning_rates(),
                               metrics={k: float(v) for k, v in metrics.items()})), flush=True)
-    # Preserve upstream cross-epoch accumulation: export at the first update
-    # boundary after an epoch, never discard or serialize partial gradients.
-    if completed > session.last_exported_epoch:
-        save(session, f"epoch_{completed}")
-        session.last_exported_epoch = completed
+    # Save at the first complete optimizer window reaching the requested
+    # fractional epoch; preserve cross-epoch accumulation and tail handling.
+    interval = session.vlm_config.get("save_epoch_interval", 1.0)
+    completed_intervals = int(session.state.global_step / (session.steps_per_epoch * interval))
+    if completed_intervals > session.last_exported_save_interval:
+        save(session, f"epoch_{completed_intervals * interval:g}")
+        session.last_exported_save_interval = completed_intervals
 
 
 def run(argv=None):
@@ -383,12 +389,15 @@ def run(argv=None):
                         help="reuse effective_config.json + skipped_training.jsonl from a compatible run; images/processor must be unchanged")
     parser.add_argument("--save-training-state", action="store_true",
                         help="also save per-rank optimizer/RNG state for resume; default exports inference weights only")
-    parser.add_argument("--report-to", choices=["none", "tensorboard", "wandb"],
+    parser.add_argument("--report-to", choices=["none", "tensorboard", "wandb", "swanlab"],
                         help="optional scalar tracking; defaults to YAML report_to")
+    parser.add_argument("--swanlab-project", help="SwanLab project name")
+    parser.add_argument("--swanlab-name", help="SwanLab experiment name")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    if args.report_to is not None:
-        cfg["report_to"] = args.report_to
+    for key in ("report_to", "swanlab_project", "swanlab_name"):
+        if getattr(args, key) is not None:
+            cfg[key] = getattr(args, key)
     for key in ("target_model", "train_data", "output_dir"):
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
@@ -477,7 +486,7 @@ def run(argv=None):
                     device_id=torch.cuda.current_device())
         layouts = build_fsdp_layouts(fsdp, parameters, specs)
     training_args = SimpleNamespace(**cfg)
-    # Logging each optimizer boundary permits per-epoch exports without changing
+    # Logging each optimizer boundary permits fractional-epoch exports without changing
     # the original runner's cross-epoch accumulation/tail semantics.
     if training_args.log_interval != 1:
         raise ValueError("aligned VLM epoch exports require log_interval=1 (operational logging only)")
@@ -491,7 +500,7 @@ def run(argv=None):
                               steps_per_epoch=batches_per_rank, total_steps=total)
     session.vlm_config, session.records, session.processor = cfg, records, processor
     session.sampler, session.device, session.base_dir = sampler, device, path.parent
-    session.last_exported_epoch = 0
+    session.last_exported_save_interval = 0
     session.save_training_state = args.save_training_state
     session.tracker = SimpleNamespace(log=lambda *a, **kw: None, close=lambda: None)
     if cfg["report_to"] != "none":
@@ -509,7 +518,9 @@ def run(argv=None):
     if saved is not None:
         optimizer.load_state_dict(saved["optimizer"])
         session.state = RunState(**saved["cursor"])
-        session.last_exported_epoch = session.state.global_step // batches_per_rank
+        session.last_exported_save_interval = int(
+            session.state.global_step / (batches_per_rank * cfg.get("save_epoch_interval", 1.0))
+        )
         restore_rng(saved["rng"])
     else:
         random.seed(cfg["seed"] + rank())

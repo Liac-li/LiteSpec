@@ -507,6 +507,7 @@ class Qwen3DLiteAttention(nn.Module):
         target_hidden: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        shared_context_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
@@ -515,22 +516,33 @@ class Qwen3DLiteAttention(nn.Module):
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
-        k_ctx = self.k_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
 
         cos, sin = position_embeddings
 
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if shared_context_kv is None:
+            k_ctx = self.k_proj(target_hidden)
+            v_ctx = self.v_proj(target_hidden)
+            k = torch.cat([k_ctx, k_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            )
+            v = torch.cat([v_ctx, v_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            )
+            k = self.k_norm(k).transpose(1, 2)
+            v = v.transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            # Context keys already have their shared key norm and CHS RoPE.
+            # Only draft-token Q/K/V evolve through the decoder layers.
+            k_noise = self.k_norm(
+                k_noise.view(bsz, q_len, -1, self.head_dim)
+            ).transpose(1, 2)
+            v_noise = v_noise.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+            q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
+            k = torch.cat([shared_context_kv[0], k_noise], dim=2)
+            v = torch.cat([shared_context_kv[1], v_noise], dim=2)
 
         if self.config._attn_implementation == "flex_attention":
             # Call FlexAttention directly.  Transformers requests LSE during
@@ -594,6 +606,7 @@ class Qwen3DLiteDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        shared_context_kv: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -607,6 +620,7 @@ class Qwen3DLiteDecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             output_attentions=output_attentions,
             position_embeddings=position_embeddings,
+            shared_context_kv=shared_context_kv,
             **kwargs,
         )[0]
         hidden_states = residual + hidden_states
@@ -689,6 +703,23 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 f"target_layer_ids {invalid_layer_ids} are outside [0, "
                 f"{int(config.num_target_layers) - 1}]."
             )
+        self.shared_stage_kv = bool(dlite_config.get("shared_stage_kv", False))
+        self.chs_stage_ids = []
+        if self.shared_stage_kv:
+            if not self.is_student or self.architecture_version != "dlite_v2":
+                raise ValueError("shared_stage_kv requires a dlite_v2 student")
+            self.chs_stage_ids = [int(s) for s in dlite_config["chs_stage_ids"]]
+            if (
+                len(self.chs_stage_ids) != self.chs_num_layers
+                or sorted(set(self.chs_stage_ids)) != [0, 1, 2]
+                or self.chs_stage_ids != sorted(self.chs_stage_ids)
+            ):
+                raise ValueError(
+                    "chs_stage_ids must map every CHS to three nonempty, "
+                    "contiguous stages 0, 1, 2 in target-layer order"
+                )
+            self.stage_sizes = tuple(self.chs_stage_ids.count(s) for s in range(3))
+            dlite_config["chs_stage_ids"] = self.chs_stage_ids
         default_history_ids = [
             0,
             config.num_target_layers // 2,
@@ -750,7 +781,23 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             self.history_fuse = nn.Linear(3 * hidden_size, hidden_size, bias=False)
             self.history_norm = Qwen3RMSNorm(hidden_size, eps=config.rms_norm_eps)
         self.layer_depth_embedding = nn.Embedding(config.num_target_layers, hidden_size)
-        self.context_norm = Qwen3RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        if self.shared_stage_kv:
+            self.stage_embedding = nn.Embedding(3, hidden_size)
+            self.stage_context_norms = nn.ModuleList(
+                [Qwen3RMSNorm(hidden_size, eps=config.rms_norm_eps) for _ in range(3)]
+            )
+            kv_size = config.num_key_value_heads * self.layers[0].self_attn.head_dim
+            self.stage_k_projs = nn.ModuleList(
+                [nn.Linear(hidden_size, kv_size, bias=config.attention_bias) for _ in range(3)]
+            )
+            self.stage_v_projs = nn.ModuleList(
+                [nn.Linear(hidden_size, kv_size, bias=config.attention_bias) for _ in range(3)]
+            )
+            self.context_k_norm = Qwen3RMSNorm(
+                self.layers[0].self_attn.head_dim, eps=config.rms_norm_eps
+            )
+        else:
+            self.context_norm = Qwen3RMSNorm(hidden_size, eps=config.rms_norm_eps)
         logging.getLogger(__name__).debug(
             f"DLite: architecture_version={self.architecture_version}, "
             f"model_role={self.model_role}, "
@@ -759,6 +806,8 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             f"chs_num_layers={self.chs_num_layers}, "
             f"condition_slots={self.condition_slot_count}, "
             f"target_layer_ids={self.target_layer_ids}, "
+            f"shared_stage_kv={self.shared_stage_kv}, "
+            f"chs_stage_ids={self.chs_stage_ids}, "
             f"history_layer_ids={self.history_layer_ids}, "
             f"sequential_head={self.sequential_head_type}, "
             f"sequential_rank={self.sequential_rank}"
@@ -910,7 +959,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         return self.history_norm(self.history_fuse(flat))
 
     def _apply_chs_depth_embedding(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        """Add target-layer identity to current CHS hidden states."""
+        """Add depth/stage identity and normalize the fixed CHS conditions."""
         _, _, num_chs_slots, hidden_size = target_hidden.shape
         if num_chs_slots != self.chs_num_layers:
             raise ValueError(
@@ -922,7 +971,39 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         depth_emb = self.layer_depth_embedding(depth_ids).view(
             1, 1, self.chs_num_layers, hidden_size
         )
-        return self.context_norm(target_hidden + depth_emb)
+        hidden = target_hidden + depth_emb
+        if not self.shared_stage_kv:
+            return self.context_norm(hidden)
+        stage_ids = torch.tensor(
+            self.chs_stage_ids, device=target_hidden.device, dtype=torch.long
+        )
+        hidden = hidden + self.stage_embedding(stage_ids).view(
+            1, 1, self.chs_num_layers, hidden_size
+        )
+        return torch.cat(
+            [norm(part) for norm, part in zip(
+                self.stage_context_norms, hidden.split(self.stage_sizes, dim=2)
+            )],
+            dim=2,
+        )
+
+    def _project_shared_stage_kv(
+        self,
+        context: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project each stage once; preserve anchor-major CHS order and gradients."""
+        batch, context_len, hidden_size = context.shape
+        blocks = context.reshape(batch, -1, self.chs_num_layers, hidden_size)
+        parts = blocks.split(self.stage_sizes, dim=2)
+        k = torch.cat([proj(part) for proj, part in zip(self.stage_k_projs, parts)], dim=2)
+        v = torch.cat([proj(part) for proj, part in zip(self.stage_v_projs, parts)], dim=2)
+        head_dim = self.layers[0].self_attn.head_dim
+        k = self.context_k_norm(k.reshape(batch, context_len, -1, head_dim)).transpose(1, 2)
+        v = v.reshape(batch, context_len, -1, head_dim).transpose(1, 2)
+        cos, sin = (x[:, :context_len].unsqueeze(1) for x in position_embeddings)
+        k = (k * cos) + (rotate_half(k) * sin)
+        return k, v
 
     def build_inference_query_embeddings(
         self,
@@ -1225,6 +1306,10 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         # Qwen3RotaryEmbedding only reads x.device and x.dtype. Passing the
         # existing activation avoids allocating a dense (B, KV_LEN, H) dummy;
         position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
+        shared_context_kv = (
+            self._project_shared_stage_kv(target_hidden, position_embeddings)
+            if self.shared_stage_kv else None
+        )
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -1232,6 +1317,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 attention_mask=attention_mask,
                 position_ids=draft_pos_ids,
                 position_embeddings=position_embeddings,
+                shared_context_kv=shared_context_kv,
                 **kwargs,
             )
         return self.norm(hidden_states)

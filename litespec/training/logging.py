@@ -313,7 +313,8 @@ class SwanlabTracker(Tracker):
             swanlab.init(
                 project=args.swanlab_project,
                 experiment_name=args.swanlab_name,
-                config=vars(args),
+                config={key: value for key, value in vars(args).items()
+                        if key not in {"swanlab_key", "wandb_key"}},
                 logdir=swanlog_dir,
             )
             self.is_initialized = True

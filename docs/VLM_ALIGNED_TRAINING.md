@@ -115,8 +115,8 @@ Other exceptions (missing/corrupt images, invalid schema) abort validation rathe
 than silently changing the data. Eligible indices are broadcast, deterministically
 shuffled and padded using the original DistributedSampler behavior. The resolved
 config, eligible count and schedule are recorded in `effective_config.json`.
-Operational logging defaults to local JSON (with optional explicit W&B), and save
-cadence is shortened for this dataset. These do not change the training objective
+Operational logging uses local JSON plus the configured tracker (SwanLab in the
+current DLite YAML), and saves occur about every half epoch. These do not change the training objective
 or optimizer hyperparameters. Serving-only fields inherited from the text YAML
 are not used by the HF image target adapter.
 
@@ -143,7 +143,15 @@ separate output directory for the first GPU integration check, then unset both
 for the real run. CPU numerical tests use an independent-block SDPA reference
 because PyTorch FlexAttention has no CPU backward; CUDA never takes this fallback.
 
-## Optional training curves
+## Training curves
+
+The current DLite aligned YAML defaults to `report_to: swanlab` and project
+`qwen35-dlite-vlm`. Install `swanlab` into `.venv-vlm`, set `SWANLAB_API_KEY`, and
+use `--swanlab-project` / `--swanlab-name` on the training launcher to choose the
+project and experiment. The existing tracker logs only from rank zero, with
+optimizer-step indexing and local files under `OUTPUT_DIR/swanlog`. Authentication
+keys are excluded from its uploaded configuration. See the complete
+[six-epoch launch command](../dev-docs/qwen35-dlite-video.md#81-六轮纯-sft全局-batch-32swanlab).
 
 Install `tensorboard` into the explicit `.venv-vlm/bin/python` environment without
 upgrading the model stack. Set `REPORT_TO=tensorboard` when launching either
@@ -153,7 +161,7 @@ CE/L1 components, AdamW/Muon learning rates, pre-clipping gradient norm, epoch
 progress, token accuracy and acceptance diagnostics. Training acceptance metrics
 use teacher-forced training blocks; they are not held-out autoregressive decoding
 measurements. `REPORT_TO=wandb` also reuses the original tracker and its login
-configuration; tracking remains off unless explicitly selected.
+configuration. `REPORT_TO=none` disables external tracking.
 
 For a job already running with tracking disabled, keep it running and execute:
 
@@ -187,12 +195,16 @@ SAVE_TRAINING_STATE=1 OUTPUT_DIR="/absolute/path/to/the/run" \
 bash scripts/dlite/run_training_vlm.sh --resume /absolute/path/to/the/run/last
 ```
 
-Scheduled saves occur every 4000 global microsteps at completed accumulation
-boundaries, after the first update boundary reaching each epoch, and at completion.
-The upstream runner carries partial windows across epochs: an epoch export may
-therefore include the first 1-3 microbatches of the following epoch. No partial
-gradient window is dropped or incorrectly resumed. Tail normalization follows the
-original runner. Final total updates are `ceil(6 * ceil(N_eligible/world) / 4)`.
+The current DLite YAML uses `save_epoch_interval: 0.5` and `save_interval: 0`.
+Saves occur at the first completed accumulation boundary reaching each half
+epoch, and at completion; duplicate saves at the same optimizer step are merged.
+With accumulation 4, an export can include up to three microbatches after its
+requested boundary. `checkpoint.json` records the save reason and actual
+fractional epoch progress. The upstream runner still carries partial windows
+across epochs. No partial gradient window is dropped or incorrectly resumed.
+Positive `save_interval` values still enable fixed-microstep saves in other
+recipes. Final updates with the default micro batch 1 are
+`ceil(6 * ceil(N_eligible/world) / 4)`.
 
 ## Progress and remaining time
 

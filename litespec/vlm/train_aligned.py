@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import random
+import time
 from types import SimpleNamespace
 import uuid
 
@@ -28,6 +29,7 @@ from litespec.training.fsdp_layout import build_fsdp_layouts
 from litespec.training.muon import muon_config_from_args
 from litespec.training.optimizer import BF16Optimizer, optimizer_step_count, register_optimizer_parameters
 from litespec.training.runner import configure_rank_caches, run_draft
+from litespec.training.timing import StepTiming, timed
 from .runtime import load_target, prepare_example, read_records
 from .train import make_draft
 from .progress import StepProgress
@@ -60,6 +62,8 @@ def load_config(path):
         raise ValueError("epochs, accumulation and anchors must be positive")
     if cfg.get("save_epoch_interval", 1.0) <= 0 or cfg["save_interval"] < 0:
         raise ValueError("save_epoch_interval must be positive; save_interval must be >= 0")
+    if cfg.get("timing_steps", 0) < 0:
+        raise ValueError("timing_steps must be >= 0")
     cfg["upstream_config_sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
     cfg["context_policy"] = dict(prefill_text="drop", prefill_vision="drop", decode_mode="none",
                                  window_size=0, implementation="compact")
@@ -249,7 +253,7 @@ def make_online(target, draft, cfg):
     )
 
 
-def prepare_forward(target, online, example):
+def prepare_forward(target, online, example, *, timing=None):
     """Original anchors/labels/positions; HF target retains its image and MRoPE inputs."""
     ids = example.inputs["input_ids"]
     mask = loss_mask(example)
@@ -267,13 +271,20 @@ def prepare_forward(target, online, example):
     # Project only distinct supervised text positions, then gather the block layout.
     unique, inverse = positions.reshape(-1).unique(sorted=True, return_inverse=True)
     with torch.no_grad():
-        output = target(**example.inputs, use_cache=False, output_hidden_states=True,
-                        logits_to_keep=unique)
+        with timed(timing, "target_forward"):
+            output = target(**example.inputs, use_cache=False, output_hidden_states=True,
+                            logits_to_keep=unique)
         indices = inverse.reshape(ids.size(0), -1)
         reference = output.logits.gather(1, indices.unsqueeze(-1).expand(-1, -1, output.logits.size(-1)))
         reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
+    if timing is not None and timing.active:
+        timing.record("sequence_length", ids.size(1))
+        timing.record("active_anchors", batch.block_keep_mask.sum().item())
+        active = batch.binary_eval_mask.sum().item()
+        timing.record("supervised_positions", active)
+        timing.record("draft_vocab_elements", active * online.draft_model.config.vocab_size)
     return dict(prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
                 target_logits_are_gathered=True)
 
@@ -287,8 +298,11 @@ class VLMAdapter:
 
     def compute_step(self, session, example, *, microbatch_start=None, microbatch_end=None,
                      collect_detailed_metrics=True):
-        inputs = prepare_forward(session.target, session.draft_online, example)
-        return session.fsdp_model(**inputs, collect_detailed_metrics=collect_detailed_metrics)
+        timing = getattr(session, "timing", None)
+        with timed(timing, "target_prepare"):
+            inputs = prepare_forward(session.target, session.draft_online, example, timing=timing)
+        with timed(timing, "draft_forward_loss"):
+            return session.fsdp_model(**inputs, collect_detailed_metrics=collect_detailed_metrics)
 
 
 def rng_state():
@@ -306,6 +320,7 @@ def restore_rng(value):
 
 def save(session, name):
     """Atomic inference export, with optional rank-local resumable state."""
+    save_started = time.perf_counter()
     root = Path(session.args.output_dir)
     destination = root / f"step_{session.state.optimizer_step:07d}"
     exists = destination.exists() if rank() == 0 else None
@@ -347,9 +362,12 @@ def save(session, name):
         link = root / (".last-" + uuid.uuid4().hex)
         link.symlink_to(destination.name, target_is_directory=True)
         os.replace(link, root / "last")
-        print(f"Saved checkpoint: {destination}", flush=True)
     if dist.is_initialized():
         dist.barrier()
+    if rank() == 0:
+        elapsed = time.perf_counter() - save_started
+        session.tracker.log({"timing/checkpoint_seconds": elapsed}, step=session.state.optimizer_step)
+        print(f"Saved checkpoint: {destination} (save_seconds={elapsed:.3f})", flush=True)
 
 
 def source_batches(session, phase):
@@ -374,7 +392,27 @@ def source_batches(session, phase):
             yield collate_examples(examples, pad_token_id=pad if pad is not None else 0)
 
 
+def timing_report(session):
+    timer = getattr(session, "timing", None)
+    local = timer.snapshot() if timer is not None else None
+    if local is None:
+        return {}, None
+    rows = [local]
+    if dist.is_initialized():
+        rows = [None] * world()
+        dist.all_gather_object(rows, local)
+    stages = sorted({key for row in rows for key in row["seconds"]})
+    maxima = {key: max(row["seconds"].get(key, 0.0) for row in rows) for key in stages}
+    means = {key: sum(row["seconds"].get(key, 0.0) for row in rows) / len(rows) for key in stages}
+    scalars = {f"timing/{key}_max_seconds": value for key, value in maxima.items()}
+    scalars.update({f"timing/{key}_mean_seconds": value for key, value in means.items()})
+    return scalars, dict(seconds_rank_max=maxima, seconds_rank_mean=means,
+                         slowest_rank=max(range(len(rows)), key=lambda r: rows[r]["seconds"]["window"]),
+                         ranks=rows)
+
+
 def log(session, window, grad_norm):
+    log_started = time.perf_counter()
     metrics = window.metrics.reduce()
     progress = session.progress.update(session.state.optimizer_step)
     scalars = {k: float(v) for k, v in metrics.items()}
@@ -383,7 +421,12 @@ def log(session, window, grad_norm):
     scalars.update(grad_norm=float(grad_norm),
                    epoch_progress=session.state.global_step / session.steps_per_epoch)
     scalars.update({f"progress/{k}": v for k, v in progress.items() if isinstance(v, (int, float))})
+    timing_scalars, timing_details = timing_report(session)
+    scalars.update(timing_scalars)
+    scalars["timing/log_prepare_seconds"] = time.perf_counter() - log_started
+    tracking_started = time.perf_counter()
     session.tracker.log(scalars, step=session.state.optimizer_step)
+    tracking_seconds = time.perf_counter() - tracking_started
     completed = session.state.global_step // session.steps_per_epoch
     if rank() == 0:
         print(json.dumps(dict(optimizer_step=session.state.optimizer_step,
@@ -391,6 +434,8 @@ def log(session, window, grad_norm):
                               completed_epochs=completed, loss=float(metrics["objective/loss"]),
                               **progress,
                               grad_norm=grad_norm, learning_rates=session.optimizer.get_learning_rates(),
+                              timing=timing_details, tracking_seconds=tracking_seconds,
+                              log_seconds=time.perf_counter() - log_started,
                               metrics={k: float(v) for k, v in metrics.items()})), flush=True)
     # Save at the first complete optimizer window reaching the requested
     # fractional epoch; preserve cross-epoch accumulation and tail handling.
@@ -498,6 +543,8 @@ def run(argv=None):
         draft.load_state_dict(loaded.state_dict())
         del loaded
     online = make_online(target, draft, cfg)
+    timing = StepTiming(cfg.get("timing_steps", 0), device)
+    online.timing = timing
     # Match upstream registration names and ownership before FSDP changes shapes.
     parameters, specs = register_optimizer_parameters(draft)
     fsdp = online
@@ -517,11 +564,15 @@ def run(argv=None):
                               max_grad_norm=cfg["max_grad_norm"], total_steps=total,
                               warmup_ratio=cfg["warmup_ratio"], parameters=parameters,
                               muon_config=muon_config_from_args(training_args) if cfg["use_muon"] else None,
-                              parameter_specs=specs, parameter_layouts=layouts)
+                              parameter_specs=specs, parameter_layouts=layouts,
+                              warmup_start_lr=cfg.get("warmup_start_lr"),
+                              min_lr=cfg.get("min_learning_rate", 0.0))
+    optimizer.timing = timing
     session = TrainingSession(training_args, VLMAdapter(), [phase], draft=draft, draft_online=online,
                               fsdp_model=fsdp, target=target, optimizer=optimizer,
                               steps_per_epoch=batches_per_rank, total_steps=total)
     session.vlm_config, session.records, session.processor = cfg, records, processor
+    session.timing = timing
     session.sampler, session.device, session.base_dir = sampler, device, path.parent
     session.last_exported_save_interval = 0
     session.save_training_state = args.save_training_state

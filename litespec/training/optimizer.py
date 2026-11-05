@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
 from torch.optim.lr_scheduler import LRScheduler as _LRScheduler
 
 from litespec.distributed import print_on_rank0
+from .timing import timed
 
 
 def register_optimizer_parameters(model, parameters=None):
@@ -183,8 +184,10 @@ class WarmupScheduler(TwoStageScheduler):
             the schedule is started from the beginning or When last_epoch=-1, sets initial lr as lr.
     """
 
-    def __init__(self, optimizer, warmup_epochs, after_scheduler, last_epoch=-1):
+    def __init__(self, optimizer, warmup_epochs, after_scheduler, last_epoch=-1,
+                 warmup_start_lr=None):
         self.warmup_epochs = int(warmup_epochs)
+        self.warmup_start_lr = warmup_start_lr
         super().__init__(optimizer, after_scheduler, last_epoch)
 
     def get_lr(self):
@@ -192,8 +195,14 @@ class WarmupScheduler(TwoStageScheduler):
             if not self.finished:
                 self.after_scheduler.base_lrs = self.base_lrs
                 self.finished = True
+                if self.warmup_start_lr is not None:
+                    return self.base_lrs
             return self.after_scheduler.get_lr()
 
+        if self.warmup_start_lr is not None:
+            progress = self.last_epoch / self.warmup_epochs
+            return [self.warmup_start_lr + progress * (lr - self.warmup_start_lr)
+                    for lr in self.base_lrs]
         return [(self.last_epoch + 1) / self.warmup_epochs * lr for lr in self.base_lrs]
 
     def step(self, epoch=None):
@@ -328,6 +337,7 @@ class CosineAnnealingWarmupLR(WarmupScheduler):
         warmup_steps: int = 0,
         eta_min: float = 0.0,
         last_epoch: int = -1,
+        warmup_start_lr: float | None = None,
     ):
         base_scheduler = _CosineAnnealingLR(
             optimizer,
@@ -335,7 +345,8 @@ class CosineAnnealingWarmupLR(WarmupScheduler):
             eta_min=eta_min,
             last_epoch=last_epoch,
         )
-        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch,
+                         warmup_start_lr=warmup_start_lr)
 
 
 class BF16Optimizer:
@@ -352,6 +363,8 @@ class BF16Optimizer:
         muon_config=None,
         parameter_specs=None,
         parameter_layouts=None,
+        warmup_start_lr=None,
+        min_lr=0.0,
     ):
         self.model = model
         self.use_muon = muon_config is not None
@@ -392,6 +405,8 @@ class BF16Optimizer:
             total_steps=int(total_steps),
             warmup_ratio=float(warmup_ratio),
         )
+        if warmup_start_lr is not None or min_lr != 0:
+            self.optimizer_config.update(warmup_start_lr=warmup_start_lr, min_lr=float(min_lr))
         if self.use_muon:
             # Legacy lr/weight_decay are deliberately irrelevant in hybrid mode.
             self.optimizer_config.update(
@@ -477,6 +492,8 @@ class BF16Optimizer:
                 self.optimizer,
                 total_steps=total_steps,
                 warmup_steps=int(warmup_ratio * total_steps),
+                warmup_start_lr=warmup_start_lr,
+                eta_min=min_lr,
             )
             if self.optimizer is not None
             else None
@@ -486,6 +503,8 @@ class BF16Optimizer:
                 self.muon_optimizer,
                 total_steps=total_steps,
                 warmup_steps=int(warmup_ratio * total_steps),
+                warmup_start_lr=warmup_start_lr,
+                eta_min=min_lr,
             )
 
     def zero_grad(self) -> None:
@@ -572,13 +591,15 @@ class BF16Optimizer:
                         param.grad.mul_(clip_coefficient)
 
         if self.optimizer is not None:
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
+            with timed(getattr(self, "timing", None), "optimizer_adamw"):
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scheduler.step()
         if self.muon_optimizer is not None:
-            self.muon_optimizer.step(active=[active[i] for i in self.muon_indices])
-            self.muon_optimizer.zero_grad(set_to_none=True)
-            self.muon_scheduler.step()
+            with timed(getattr(self, "timing", None), "optimizer_muon"):
+                self.muon_optimizer.step(active=[active[i] for i in self.muon_indices])
+                self.muon_optimizer.zero_grad(set_to_none=True)
+                self.muon_scheduler.step()
         with torch.no_grad():
             for p, mp in zip(self.model_params, self.fp32_params):
                 p.copy_(mp)

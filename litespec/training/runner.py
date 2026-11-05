@@ -7,6 +7,8 @@ input streams differ; a packet's microbatches never change accumulation counts.
 import os
 from pathlib import Path
 
+from .timing import timed
+
 
 # Isolate each rank's Triton/Inductor/TVM compile cache so concurrent
 # torchrun processes do not corrupt a shared kernel-build directory.
@@ -200,6 +202,7 @@ def run_draft(session, *, batch_source=iter_logical_batches, save=None, log=log_
 
     save = save_session if save is None else save
     args, state = session.args, session.state
+    timing = getattr(session, "timing", None)
     window = OptimizerWindow(
         session.optimizer, args.accumulation_steps, session.process_group
     )
@@ -214,7 +217,10 @@ def run_draft(session, *, batch_source=iter_logical_batches, save=None, log=log_
     # Perform a model parameter update after each gradient accumulation step.
     def update(*, tail=False):
         nonlocal accumulated
-        grad_norm = window.step()
+        with timed(timing, "optimizer"):
+            grad_norm = window.step()
+        if timing is not None:
+            timing.finish()
         state.optimizer_step += 1
         accumulated = 0
         if (
@@ -249,8 +255,11 @@ def run_draft(session, *, batch_source=iter_logical_batches, save=None, log=log_
         )
         batch_iterator = iter(batch_source(session, cur_phase))
         for _ in range(remaining_batches):
+            if timing is not None and accumulated == 0:
+                timing.begin(state.optimizer_step)
             try:
-                data = next(batch_iterator)
+                with timed(timing, "data"):
+                    data = next(batch_iterator)
             except StopIteration as exc:
                 raise RuntimeError(
                     f"{cur_phase.name} input ended before the declared phase length"
@@ -283,7 +292,8 @@ def run_draft(session, *, batch_source=iter_logical_batches, save=None, log=log_
                     microbatch_end=end,
                     collect_detailed_metrics=collect_detailed_metrics,
                 )
-                window.backward(output)
+                with timed(timing, "backward"):
+                    window.backward(output)
                 del output
             state.phase_step += 1
             state.global_step += 1

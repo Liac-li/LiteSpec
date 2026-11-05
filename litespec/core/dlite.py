@@ -29,6 +29,7 @@ from litespec.core.losses import weighted_ce_l1, weighted_cross_entropy, weighte
 from litespec.core.outputs import RatioTerms, TrainingOutput
 from litespec.modeling.draft.dlite import DLiteDraftModel
 from litespec.modeling.draft.flex_attention import flex_kernel_options
+from litespec.training.timing import timed
 
 HiddenStatesInput = Union[
     tuple[torch.Tensor, ...], list[torch.Tensor], Dict[int, torch.Tensor]
@@ -678,7 +679,9 @@ class OnlineDLiteModel(nn.Module):
             seq_len = input_ids.size(1)
         if seq_len is None:
             raise ValueError("seq_len is required with prepared_batch")
-        prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len)
+        timing = getattr(self, "timing", None)
+        with timed(timing, "draft_backbone"):
+            prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len)
         if return_transition_outputs:
             if target_prefill_logits is None:
                 raise ValueError(
@@ -725,12 +728,13 @@ class OnlineDLiteModel(nn.Module):
                 self.block_size,
             )
         )
-        return self.compute_supervised_loss(
-            prediction_hidden,
-            prepared_batch,
-            gathered_target_logits,
-            collect_detailed_metrics=collect_detailed_metrics,
-        )
+        with timed(timing, "draft_head_loss"):
+            return self.compute_supervised_loss(
+                prediction_hidden,
+                prepared_batch,
+                gathered_target_logits,
+                collect_detailed_metrics=collect_detailed_metrics,
+            )
 
 
 def compute_stage1_distillation_loss(

@@ -50,3 +50,13 @@ The server estimates about 43 minutes to validate 95,420 records serially on ran
 existing ranks, keeping exactly the same per-record encoding/filtering and
 deterministic eligible sample set. Preserve completed-validation reuse and the
 current environment, model, training and checkpoint settings. No new tests.
+
+## Loss, learning rate and training-speed diagnosis
+
+The user now requests CE:L1 coefficients of 1:1. Both AdamW and Muon start at
+1e-4, linearly warm up over 5% of optimizer steps to a peak of 1e-3, and then
+cosine-decay to 3e-4. This clarifies that "initialization" meant LR, not model
+weight initialization. Keep pure SFT, six epochs/global batch 32 and the current architecture.
+Add phase timing logs to identify the server's roughly 80–100 seconds per update,
+including data processing, target, draft backbone/head/loss, backward and optimizer
+work. Preserve the user-managed environment and do not add test files.

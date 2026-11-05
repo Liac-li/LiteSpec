@@ -98,3 +98,32 @@ not trigger any image re-encoding. No additional worker processes, model copies,
 dataset conversion, filtering shortcuts or environment changes are introduced.
 Inspect the actual preflight with CPU/Gloo ranks and compare with serial results,
 including exclusions and error propagation. Server throughput is unverified.
+
+## Updated loss/LR and timing contract
+
+The active VLM YAML overrides final CE=1, L1=1, AdamW and Muon peak LR=1e-3,
+warmup_start_lr=1e-4, min_learning_rate=3e-4 and warmup_ratio=0.05. Both optimizers
+start at exactly 1e-4, reach 1e-3 at warmup completion, then cosine-decay to 3e-4
+at the final optimizer step. Base CE remains disabled and gamma remains 4.
+Omitting the new scheduler options preserves legacy scheduling. These are coefficients, not a promise
+that raw CE and L1 magnitudes will be equal.
+
+Enable `timing_steps: 10` for the first ten optimizer windows; zero disables it.
+Measure wall time with CUDA synchronization at stage boundaries during these
+windows. Include data/transfer, target preparation (plus target-forward child),
+draft forward/loss (plus backbone and head/loss children), backward and optimizer
+(plus AdamW and Muon children). Inclusive parent and child timings must be labeled
+and must not be added together. Record input length, active anchors, supervised
+positions and projected vocabulary elements to explain different workloads.
+
+Reuse the existing JSON optimizer log and SwanLab. Gather completed timing windows
+from all ranks; expose per-stage rank means/maxima and the slowest window rank.
+Log workload details per rank. Timing windows exclude tracking/checkpoint callbacks;
+emit their wall times separately so logging/saving pauses remain visible.
+Synchronization deliberately perturbs overlap, so these are diagnostics, not a
+claim of uninstrumented throughput. Outside selected windows do not synchronize
+for per-stage timing. No automatic training-parameter or environment changes.
+
+Inspect the real scheduler, weighted objective and timing/log callbacks on CPU;
+GPU bottlenecks require the user's server logs. Reuse completed input validation
+when restarting with changed loss/LR; do not silently resume incompatible state.

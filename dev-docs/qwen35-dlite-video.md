@@ -198,17 +198,17 @@ scripts/dlite/run_training_vlm.sh
 | 每条样本最多 anchor 数 | 512 |
 | 精度 | BF16，优化器使用 FP32 master 参数 |
 | 优化器 | Muon + AdamW |
-| Muon | LR `0.02`，momentum `0.95`，weight decay `0` |
-| AdamW | LR `4e-4`，weight decay `0` |
-| Warmup / 调度 | `0.04` / 上游 cosine 调度 |
+| Muon | 峰值 LR `1e-3`，momentum `0.95`，weight decay `0` |
+| AdamW | 峰值 LR `1e-3`，weight decay `0` |
+| 两组 LR 曲线 | 从 `1e-4` 起步，前 `5%` optimizer steps 线性升到 `1e-3`，之后 cosine 降到 `3e-4` |
 | Gradient clipping | 全局 norm `1.0` |
-| Final CE / 概率 L1 / base LM CE 权重 | `0.1 / 1.0 / 0.0` |
+| Final CE / 概率 L1 / base LM CE 权重 | `1.0 / 1.0 / 0.0` |
 | 位置衰减 | `gamma=4` |
 | Seed | 模型 seed 42；DistributedSampler seed 0 |
 | 图文配置日志 / 保存间隔 | 每个 optimizer step 记录；每 0.5 epoch 保存 |
 | 日志后端 | 图文 YAML 默认 SwanLab；项目 `qwen35-dlite-vlm` |
 
-本次训练六轮全部使用纯 SFT 的 `0.1 CE + 1.0 L1`，从随机初始化的 student
+本次训练六轮全部使用纯 SFT 的 `1.0 CE + 1.0 L1`，从随机初始化的 student
 开始，不包含 DFlash teacher 或 KL warm-up。全局有效 batch 32 对应八卡、
 每卡 micro batch 1、梯度累积 4。
 
@@ -220,7 +220,7 @@ scripts/dlite/run_training_vlm.sh
 损失只覆盖 assistant 回答位置：
 
 ```text
-L = weighted_mean[0.1 × CE(argmax p_target, q_draft)
+L = weighted_mean[1.0 × CE(argmax p_target, q_draft)
                   + ||p_target - q_draft||_1]
 ```
 
@@ -490,6 +490,56 @@ SwanLab 复用现有 tracker，只由 rank 0 初始化和上传，横轴为 opti
 forcing blocks，不能当作视频推理的实测 acceptance 或加速比。运行配置上传时
 不包含认证 key。SwanLab 的在线日志与本地 `swanlog/` 使用 SDK 的
 [标准 init/log 接口](https://docs.swanlab.cn/en/api/py-init.html)。
+
+当前 CE/L1 的 **系数**为 1:1，不代表原始数值等大。随机初始化时 CE 约 12.5、
+L1 约 2，新总 loss 可能从旧配方的约 3.25 变为约 14.5，不能直接比较总值。
+对于当前服务器的 10,634 个 optimizer steps，5% warmup 对应 531 步；两组
+优化器均采用 `1e-4 → 1e-3 → 3e-4`。`learning_rate`、`muon_adamw_lr`、
+`muon_lr` 配置的是峰值；`warmup_start_lr=1e-4` 配置起点，
+`min_learning_rate=3e-4` 配置 cosine 终点。现有日志在每次更新后记录 scheduler
+为下一步设置的 LR，因此第一条日志会略高于起始 LR。
+
+### 8.1.1 分阶段耗时日志
+
+`timing_steps: 10` 在前十个 optimizer window 开启同步计时。各项为这一整个
+累积窗口的秒数（默认四个 microbatch），JSON 的 `timing.seconds_rank_max` 和
+`timing.seconds_rank_mean` 汇总所有 ranks：
+
+| 字段 | 范围 |
+| --- | --- |
+| `data` | 图片/文本准备、拼 batch 和传输到设备 |
+| `target_prepare` | anchor 准备、target、logit gather 和训练 batch 构造 |
+| `target_forward` | 上一项内的 target forward 子项 |
+| `draft_forward_loss` | FSDP draft forward 与 loss 全过程 |
+| `draft_backbone` | 上一项内的 backbone 子项 |
+| `draft_head_loss` | 上一项内的 RNN、词表投影、CE/L1 与训练指标子项 |
+| `backward` | 梯度回传，包含其通信等待 |
+| `optimizer` | 梯度归一化、更新及 FP32 master 回写 |
+| `optimizer_adamw` / `optimizer_muon` | optimizer 内的两个更新子项 |
+| `window` | 整个 optimizer window，排除本次 tracking/checkpoint 回调 |
+
+父项和子项有包含关系，不能相加。不同阶段的最大值也可能来自不同 rank。
+`timing.ranks` 保留各 rank 的原始秒数、调用次数、输入长度、有效 anchors、监督
+位置数、词表投影元素数和 CUDA 峰值分配；`slowest_rank` 指本窗口最慢 rank。
+显存峰值是训练启动后的累计峰值，不是独立重置的每窗口峰值。
+SwanLab 对应字段为 `timing/<stage>_max_seconds` 和
+`timing/<stage>_mean_seconds`。现有 JSON 另有 `tracking_seconds`、`log_seconds`，
+checkpoint 保存日志另有 `save_seconds`。
+`tracking_seconds` 记录 tracker 调用返回的时间，不包含异步后台上传的全部耗时。
+
+首用编译耗时计入相应阶段。诊断窗口会在 CUDA 边界同步，影响原来的重叠，
+所以不能作为无插桩吞吐测量。第十步之后自动停止分阶段同步计时；设置
+`timing_steps: 0` 可关闭。当前只通过了 CPU 小模型检查，尚不能确定服务器
+瓶颈，需根据新的耗时日志定位。
+
+变更 loss/LR 后使用新 run。可复用已完成的输入校验来避免重新检查图片：
+
+```bash
+REUSE_VALIDATION_FROM=/home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec/runs/dlite-stage-sft-6ep-gb32-b8-data100k20261105_064721 \
+bash train.sh
+```
+
+这里仅复用数据资格检查，不加载旧模型权重或优化器状态。
 
 ### 8.2 保存结果与节奏
 

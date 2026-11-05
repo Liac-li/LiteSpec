@@ -3,7 +3,8 @@
 The default `scripts/dlite/run_training_vlm.sh` now runs
 `litespec.vlm.train_aligned`. It inherits training hyperparameters directly from
 `scripts/config/dlite_sft.yaml`, through
-`scripts/config/vlm/sft_student_aligned.yaml`. The previous `vlm.train` implementation
+`scripts/config/vlm/sft_student_aligned.yaml`, which overrides the current loss
+weights, learning rates and warmup ratio. The previous `vlm.train` implementation
 and `sft_student_ddp.yaml` remain as legacy smoke-test code only.
 
 ## Effective defaults
@@ -18,10 +19,10 @@ and `sft_student_ddp.yaml` remain as legacy smoke-test code only.
 | Batch / accumulation | 1 image per rank / 4 microbatches |
 | Eight-GPU global batch | 32 images per full optimizer window |
 | Optimizer / precision | Upstream sharded Muon + AdamW / FP32 masters |
-| Muon LR / momentum / decay | 0.02 / 0.95 / 0 |
-| AdamW LR / decay | 0.0004 / 0 |
-| Warmup / schedule | 0.04 / upstream cosine schedule |
-| CE / probability L1 / base CE | 0.1 / 1 / 0 |
+| Muon peak LR / momentum / decay | 0.001 / 0.95 / 0 |
+| AdamW peak LR / decay | 0.001 / 0 |
+| Both LR curves | start 0.0001, linear warmup over 5%, peak 0.001, cosine to 0.0003 |
+| CE / probability L1 / base CE | 1 / 1 / 0 |
 | Position decay / clipping | gamma 4 / global norm 1 |
 
 `batch_size` can be increased above 1. Images retain separate patch grids and
@@ -225,6 +226,18 @@ and checkpoint pauses after the preceding log; estimates fluctuate with image
 sizes, compilation and checkpointing. Initial validation/loading and evaluation
 after training are outside this estimate. Debug runs use their explicit step cap.
 Native trackers also receive numeric progress fields.
+
+The active YAML also enables `timing_steps: 10`. The first ten optimizer windows
+record synchronized wall times for data/transfer, target preparation/forward,
+draft forward/backbone/head-loss, backward and optimizer/AdamW/Muon. JSON logs
+contain rank means/maxima, slowest rank, per-rank sequence length/anchor/vocabulary
+workload and CUDA peak allocation. SwanLab receives `timing/*_max_seconds` and
+`timing/*_mean_seconds`. Parent and child stages overlap and must not be summed.
+`tracking_seconds`/`log_seconds` report tracking and log-callback overhead;
+checkpoint messages include `save_seconds`. Compilation is included in first-use
+stage timings. Synchronization changes overlap during these diagnostic windows;
+set `timing_steps: 0` to disable stage timing. Later windows have no stage-timing
+synchronization. These CPU-checked diagnostics are not a server speed result.
 
 For an already running job, no restart is needed to monitor remaining time:
 

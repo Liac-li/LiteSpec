@@ -121,3 +121,27 @@ approved local process communication. No GPU or external network was used.
 No test files were added. Syntax, whitespace and documentation references passed.
 Eight-rank CUDA/NCCL operation and server speed are not locally verified.
 Record: `tests/outputs/parallel_validation_inspection/inspection.json`.
+
+## Loss/LR and speed logging follow-up
+
+- [x] Override active YAML: CE/L1=1/1; both LRs start 1e-4, peak 1e-3 after 5%
+  warmup, then cosine to 3e-4. Preserve old scheduler behavior when options are absent.
+- [x] Add a small optional stage timer used by the shared runner, VLM adapter,
+  DLite forward and optimizer; first ten windows only, synchronized on CUDA.
+- [x] Summarize rank-mean/max stage seconds and workload in JSON/SwanLab; expose
+  logging and checkpoint wall times separately.
+- [x] Inspect scheduler endpoints, objective weighting and timing callbacks on
+  CPU without new tests; update docs and provide a validation-reuse launch command.
+
+The production scheduler was stepped for 10,634 updates: start=1e-4, LR at warmup
+completion (531)=1e-3, final=3e-4. Omitting the new options exactly reproduced the
+pre-change LR sequence. Full CPU runner inspection used a tiny frozen target and
+five-layer stage draft, four optimizer updates and real Muon/AdamW updates.
+CE+L1 equaled the logged total; both optimizer LRs ended at 3e-4. Timings appeared
+on the configured first two windows and stopped afterward. Four microbatches
+produced four data/target/draft/backward calls and one AdamW/Muon call per window.
+Profiled vs unprofiled final weights were exactly equal on CPU. The only local
+import substitution was the distributed print helper, because yunchang is absent;
+no environment changes or test files were made. CUDA synchronization, eight-rank
+timing aggregation and actual bottlenecks still require server execution.
+Records: `tests/outputs/training_timing_inspection/{schedule,inspection}.json`.

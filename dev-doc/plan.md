@@ -101,3 +101,23 @@ Both launchers pass `bash -n` and whitespace inspection. The active training
 scripts contain no `.venv-vlm`, `PYTHON_BIN` or `DLITE_WORKSPACE` references.
 The user's existing authentication assignment, 100k data path and full-state
 save flag were preserved. No training or environment installation was run.
+
+## Parallel validation follow-up
+
+- [x] Add optional original-index selection to `validate_records`, retaining its
+  current per-record processor/anchor checks and skip messages.
+- [x] Shard fresh validation over current ranks in `preflight`, gather results,
+  propagate errors and restore manifest order. Preserve rank-zero reuse/broadcast.
+- [x] Inspect serial vs multi-rank behavior and update the training documentation
+  and restart instructions. No new test files or environment changes.
+
+Direct inspection used eleven local image records, the real Qwen2VL PIL image
+processor with a deterministic local template, and two CPU/Gloo ranks. Valid
+indices, excluded records and eligible SHA256 exactly matched serial validation;
+rank-zero reuse/broadcast returned the same result without processor access. A
+missing image on rank one produced the same rank-attributed error on both ranks.
+The sandbox initially blocked local sockets; this inspection completed after
+approved local process communication. No GPU or external network was used.
+No test files were added. Syntax, whitespace and documentation references passed.
+Eight-rank CUDA/NCCL operation and server speed are not locally verified.
+Record: `tests/outputs/parallel_validation_inspection/inspection.json`.

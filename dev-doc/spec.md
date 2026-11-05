@@ -83,3 +83,18 @@ using the environment already activated by the user. No environment activation
 or package installation is performed by either launcher. Preserve the current
 100k data path, six epochs/global batch 32, SwanLab, half-epoch saves, full-state
 save flag and `tee`. Shell failures stop the launcher before training proceeds.
+
+## Parallel input validation contract
+
+On a fresh validation, rank `r` checks manifest indices `r, r+world, ...` using
+its existing processor on CPU. Gather all rank results and sort valid/skipped
+records by original manifest index. Every rank receives the same complete result;
+eligible indices and their SHA256 must match the serial implementation.
+The one-rank path retains serial behavior. Catch local failures before the
+collective so all ranks report validation failure consistently.
+
+`REUSE_VALIDATION_FROM` remains a rank-zero read followed by broadcast and does
+not trigger any image re-encoding. No additional worker processes, model copies,
+dataset conversion, filtering shortcuts or environment changes are introduced.
+Inspect the actual preflight with CPU/Gloo ranks and compare with serial results,
+including exclusions and error propagation. Server throughput is unverified.

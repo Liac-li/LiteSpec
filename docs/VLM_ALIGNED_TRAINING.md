@@ -108,17 +108,27 @@ its language-layer hidden states and projects distinct needed text logits. The
 draft continues using original local positions and no historical draft KV.
 Only assistant-answer positions enter the supervision mask.
 
-Rank zero validates the manifest once before training. To match the original
+Before training, existing ranks validate disjoint manifest shards on CPU in
+parallel (eight shards for eight GPUs); no extra worker processes are created.
+Valid indices and exclusions are gathered and sorted by original manifest index,
+so filtering and the eligible-index hash match serial validation. To match the original
 dataset filter, a record needs at least `2*block_size` answer labels and one full
 block anchor. Short/overlength records are reported in `skipped_training.jsonl`.
 Other exceptions (missing/corrupt images, invalid schema) abort validation rather
-than silently changing the data. Eligible indices are broadcast, deterministically
+than silently changing the data. Every rank gets the same eligible indices, deterministically
 shuffled and padded using the original DistributedSampler behavior. The resolved
 config, eligible count and schedule are recorded in `effective_config.json`.
 Operational logging uses local JSON plus the configured tracker (SwanLab in the
 current DLite YAML), and saves occur about every half epoch. These do not change the training objective
 or optimizer hyperparameters. Serving-only fields inherited from the text YAML
 are not used by the HF image target adapter.
+
+This validation decodes images and runs processor/token-length checks, not a
+target-model forward. GPUs can be idle during it. A running process does not
+reload this code: apply the change and restart the launcher to use parallel
+validation. A completed compatible validation can still be reused through
+`REUSE_VALIDATION_FROM`; that path only reads metadata on rank zero and broadcasts
+the result, with no image encoding.
 
 ## Start a new six-epoch model
 

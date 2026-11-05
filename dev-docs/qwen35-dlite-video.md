@@ -233,6 +233,12 @@ L = weighted_mean[0.1 × CE(argmax p_target, q_draft)
 - 实际有效样本数记录在 `effective_config.json` 的 `eligible_samples`；
   排除记录写入 `skipped_training.jsonl`。
 
+输入资格检查使用现有训练 ranks 并行处理：八卡时，每个 rank 在 CPU 上检查
+约 1/8 记录，最后按原始行号汇总，保持与串行检查相同的有效样本集合和顺序。
+该阶段涉及图片解码和 processor 编码，GPU 尚未开始训练。无需增加 worker
+或修改环境。已有完整校验结果仍可用 `REUSE_VALIDATION_FROM` 复用；正在运行
+的旧进程不会热加载并行实现，需要同步代码后重新启动。
+
 源码与说明：[基础 YAML](../scripts/config/dlite_sft.yaml)、
 [图文覆盖配置](../scripts/config/vlm/sft_student_aligned.yaml)、
 [训练适配器](../litespec/vlm/train_aligned.py)、

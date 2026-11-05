@@ -42,3 +42,11 @@ activate/install an environment or assume `.venv-vlm`. The actual server checkou
 is `/home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec`. Keep the user's current 100k
 FineVision data path and `SAVE_TRAINING_STATE=1` in `train.sh`. Put output under
 this checkout's `runs/`, independent of `DLITE_WORKSPACE`.
+
+## Parallel input validation
+
+The server estimates about 43 minutes to validate 95,420 records serially on rank
+0 (about 36 samples/s), while seven training ranks wait. Parallelize preprocessing across the
+existing ranks, keeping exactly the same per-record encoding/filtering and
+deterministic eligible sample set. Preserve completed-validation reuse and the
+current environment, model, training and checkpoint settings. No new tests.

@@ -153,29 +153,52 @@ def reuse_validation(records, cfg, directory):
 
 
 def preflight(records, processor, config, cfg, base_dir, reuse_from=None):
-    """Rank zero fixes the eligible set before equal-size distributed sampling."""
+    """Validate disjoint CPU shards, then fix one ordered eligible set for all ranks."""
     packet = None
-    if rank() == 0:
+    fresh = reuse_from is None
+    if fresh and rank() == 0:
+        print(f"Validating {len(records)} records across {world()} rank(s) on CPU", flush=True)
+    if fresh or rank() == 0:
         try:
             if reuse_from is not None:
                 packet = reuse_validation(records, cfg, reuse_from)
             else:
-                packet = validate_records(records, processor, config, cfg, base_dir)
+                packet = validate_records(
+                    records, processor, config, cfg, base_dir,
+                    indices=range(rank(), len(records), world()),
+                )
         except Exception as exc:
             packet = {"error": repr(exc)}
     if dist.is_initialized():
-        payload = [packet]
-        dist.broadcast_object_list(payload, src=0)
-        packet = payload[0]
+        if fresh:
+            packets = [None] * world()
+            dist.all_gather_object(packets, packet)
+            errors = [f"rank {r}: {p['error']}" for r, p in enumerate(packets) if "error" in p]
+            packet = {"error": "; ".join(errors)} if errors else {
+                "valid": sorted(i for p in packets for i in p["valid"]),
+                "skipped": sorted(
+                    (row for p in packets for row in p["skipped"]),
+                    key=lambda row: row["index"],
+                ),
+            }
+        else:
+            payload = [packet]
+            dist.broadcast_object_list(payload, src=0)
+            packet = payload[0]
     if "error" in packet:
         raise RuntimeError(f"VLM input validation failed: {packet['error']}")
+    if fresh and rank() == 0:
+        print(f"Validation complete: {len(packet['valid'])} eligible, {len(packet['skipped'])} skipped", flush=True)
     return packet
 
 
-def validate_records(records, processor, config, cfg, base_dir):
+def validate_records(records, processor, config, cfg, base_dir, *, indices=None):
     from tqdm import tqdm
     valid, skipped = [], []
-    for index, record in enumerate(tqdm(records, desc="VLM input validation", unit="sample")):
+    indices = range(len(records)) if indices is None else indices
+    description = f"VLM input validation rank {rank()}" if world() > 1 else "VLM input validation"
+    for index in tqdm(indices, desc=description, unit="sample", position=rank()):
+        record = records[index]
         try:
             example = prepare_example(processor, config, record, device="cpu", training=True,
                                       max_length=cfg["max_length"], base_dir=base_dir)

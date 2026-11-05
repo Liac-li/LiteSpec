@@ -408,7 +408,7 @@ accepted draft tokens = committed length - 1 个已知 anchor
 
 ### 7.1 HF 训练与评测环境
 
-使用独立的 `.venv-vlm`，核心依赖由
+环境由用户自行创建和激活，启动脚本使用当前 PATH 中的 `python`。核心依赖参考
 [环境定义](../environments/vlm/pyproject.toml) 和
 [锁文件](../environments/vlm/uv.lock) 固定：
 
@@ -424,29 +424,18 @@ accepted draft tokens = committed length - 1 个已知 anchor
 驱动。扩展编译还需要适配的 CUDA toolkit。Aligned CUDA Muon trainer 显式要求
 `torch==2.9.1`。
 
-以下命令使用仓库说明中的服务器目录；若实际部署不同，先修改
-`DLITE_WORKSPACE`：
+当前服务器仓库目录是 `/home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec`。
+激活自己的训练环境后，可以检查当前解释器：
 
 ```bash
-export DLITE_WORKSPACE="$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/dllm_vllm/dlite-vlm"
-cd "$DLITE_WORKSPACE/LiteSpec"
-
-UV_PROJECT_ENVIRONMENT="$PWD/.venv-vlm" uv sync \
-  --project environments/vlm --frozen \
-  --extra cu128 --extra accelerated
-
-source .venv-vlm/bin/activate
-
-uv pip install --python "$PWD/.venv-vlm/bin/python" \
-  av pandas pyarrow tensorboard
+python -c 'import sys; print(sys.executable)'
 ```
 
 按服务器驱动和编译工具链选择 `cu128` 或 `cu130`，二选一。视频 `per_token`
 路径在 CUDA 上需要 causal-conv1d 和 Triton。`av/pandas/pyarrow/tensorboard`
 目前未纳入这份 VLM 锁文件，若需固定全部环境，应另外保留实际安装版本。
 
-不要把根目录 legacy SGLang 依赖装入此环境，也不要直接用默认 `uv-base` 运行
-这条训练链路；运行时显式使用 `.venv-vlm/bin/python`。
+训练脚本不安装依赖、不激活或切换虚拟环境，也不假定环境位于 `.venv-vlm`。
 
 ### 7.2 SGLang 回答生成环境
 
@@ -463,39 +452,26 @@ $HOME/.conda/envs/dflash/bin/python
 
 ## 8. 复现命令
 
-以下命令沿用上一节的 `DLITE_WORKSPACE`，均从 `$DLITE_WORKSPACE/LiteSpec` 执行。
-它们是启动说明，本次整理没有实际启动生成、训练或 GPU 评测。
+以下命令使用用户提供的服务器 checkout。它们是启动说明，本次整理没有实际
+启动生成、训练或 GPU 评测。
 
 ### 8.1 六轮纯 SFT、全局 batch 32、SwanLab
 
-在服务器的 LiteSpec 仓库根目录执行。下面沿用基础入口的 20k 候选数据组；
-实际有效训练条数以预检查生成的 `effective_config.json` 为准。
+用户自行激活训练环境后执行：
 
 ```bash
-export DLITE_WORKSPACE="$(dirname "$PWD")"
-export PYTHON_BIN="$PWD/.venv-vlm/bin/python"
-uv pip install --python "$PYTHON_BIN" swanlab
-export SWANLAB_API_KEY='替换为你的 SwanLab API key'
-
-export TARGET_MODEL="/home/jovyan/LMM/lmm_model/Qwen3.5-4B"
-export TRAIN_DATA="$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/train.jsonl"
-export CONFIG="$PWD/scripts/config/vlm/sft_student_aligned.yaml"
-export ALGORITHM=dlite
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export NPROC_PER_NODE=8
-export REPORT_TO=swanlab
-export SAVE_TRAINING_STATE=0
-RUN_NAME="dlite-stage-sft-6ep-gb32-b8-$(date +%Y%m%d_%H%M%S)"
-export OUTPUT_DIR="$DLITE_WORKSPACE/runs/$RUN_NAME"
-unset MAX_STEPS MAX_SAMPLES
-mkdir -p "$OUTPUT_DIR"
-set -o pipefail
-bash scripts/dlite/run_training_vlm.sh \
-  --swanlab-project qwen35-dlite-vlm \
-  --swanlab-name "$RUN_NAME" \
-  2>&1 | tee "$OUTPUT_DIR/train.log"
+cd /home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec
+bash train.sh
 ```
 
+[`train.sh`](../train.sh) 根据自身路径定位仓库，不依赖 `DLITE_WORKSPACE`。
+当前采用用户指定的 100k 候选数据路径：
+
+```text
+/home/jovyan/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/dllm_vllm/dlite-vlm/data/finevision_qwen35_10w_img1024_relaxed/train.jsonl
+```
+
+输出位于 `/home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec/runs/$RUN_NAME`。
 这条命令只训练 DLite，使用当前 YAML 及上游 direct-SFT 配方：六轮、micro
 batch 1、累积 4、block 8。总优化步数为
 `ceil(6 * floor(ceil(N_eligible / 8) / 1) / 4)`，实际值保存在有效配置中。
@@ -521,7 +497,8 @@ $OUTPUT_DIR/
 │   ├── config.json
 │   ├── model.safetensors          # 大模型可能按 Hugging Face 规则分片
 │   ├── vlm_run.json
-│   └── checkpoint.json
+│   ├── checkpoint.json
+│   └── training_state_rank_*.pt
 └── last -> step_XXXXXXX
 ```
 
@@ -534,12 +511,12 @@ $OUTPUT_DIR/
 `save_reason`（例如 `epoch_0.5`）、实际 `epoch_progress`、world size 和 cursor。
 `save_interval=0` 关闭另一个固定 microstep 保存触发器。
 
-以上命令保持 `SAVE_TRAINING_STATE=0`，保存的是 draft 推理权重与配置，不保存
-target 权重，也没有完整训练恢复状态。若需要断点恢复，从启动时改为
-`SAVE_TRAINING_STATE=1`；每个 checkpoint 会增加八个
+当前 `train.sh` 保留用户设置的 `SAVE_TRAINING_STATE=1`。每个 checkpoint 除
+draft 推理权重与配置之外，还保存八个
 `training_state_rank_00000.pt` … `training_state_rank_00007.pt`，包含优化器、
 FP32 master、scheduler、RNG 和数据 cursor。恢复时使用相同配置、数据和 world
-size，并给原命令追加 `--resume "$OUTPUT_DIR/last"`。
+size，并给内部训练命令追加 `--resume "$OUTPUT_DIR/last"`。如果只需要推理
+权重，可以在启动前将脚本中的 `SAVE_TRAINING_STATE` 改为 0。
 
 ### 8.3 用默认已有权重做视频评测
 

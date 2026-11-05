@@ -73,3 +73,13 @@ Acceptance: SwanLab CLI/config wiring and credential-free init payload are
 inspectable; real log callback scheduling respects half-epoch boundaries,
 resume cursor and full accumulation windows. No cloud upload or server training
 is claimed from local inspection.
+
+## Active-environment launch contract
+
+`train.sh` resolves its own repository directory, changes to it, and writes
+`runs/$RUN_NAME` beneath it. It must not depend on `DLITE_WORKSPACE` being set.
+The VLM launcher invokes `python` directly for both its GPU check and torchrun,
+using the environment already activated by the user. No environment activation
+or package installation is performed by either launcher. Preserve the current
+100k data path, six epochs/global batch 32, SwanLab, half-epoch saves, full-state
+save flag and `tee`. Shell failures stop the launcher before training proceeds.

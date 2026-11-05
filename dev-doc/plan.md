@@ -85,3 +85,19 @@ recording SDK, excluded auth keys from config and made no rank-one calls. No
 cloud request was made; local SwanLab and yunchang packages are absent. Syntax,
 whitespace and document-link checks passed; no test files or packages were added.
 Artifacts: `tests/outputs/swanlab_launch_inspection/inspection.json`.
+
+## Server launch correction
+
+Observed `train.sh` used unset `DLITE_WORKSPACE`, producing `/runs/...`, and the
+VLM launcher defaulted to a nonexistent `.venv-vlm/bin/python`.
+
+- [x] Anchor `train.sh` to its own directory and use repository-local output.
+- [x] Invoke active-environment `python` directly in the VLM launcher; keep the
+  user's current data/model paths, save-state flag, logging and training recipe.
+- [x] Update current launch instructions and inspect shell syntax/path references.
+  Do not start training or modify the environment.
+
+Both launchers pass `bash -n` and whitespace inspection. The active training
+scripts contain no `.venv-vlm`, `PYTHON_BIN` or `DLITE_WORKSPACE` references.
+The user's existing authentication assignment, 100k data path and full-state
+save flag were preserved. No training or environment installation was run.

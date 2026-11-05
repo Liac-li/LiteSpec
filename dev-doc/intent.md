@@ -34,3 +34,11 @@ SwanLab, and save at approximately every half epoch on completed optimizer
 boundaries. Reuse the existing tracker and provide server commands and an exact
 description of the saved artifacts. Batch 32 is confirmed as the global effective
 batch: eight GPUs, micro batch 1 per GPU, accumulation 4.
+
+## Server launch correction
+
+The user activates their own uv environment. Use its `python` from PATH; do not
+activate/install an environment or assume `.venv-vlm`. The actual server checkout
+is `/home/jovyan/LMM/liyt/Projects/DLLM/LiteSpec`. Keep the user's current 100k
+FineVision data path and `SAVE_TRAINING_STATE=1` in `train.sh`. Put output under
+this checkout's `runs/`, independent of `DLITE_WORKSPACE`.
